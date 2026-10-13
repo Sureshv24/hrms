@@ -12,6 +12,9 @@ from app.routers.attendance import router as attendance_router
 from app.models.leave import LeaveRequest
 from app.models.leave_balance import LeaveBalance
 from app.routers.leaves import router as leave_router
+from app.models.payroll import Payroll
+from app.routers.payroll import router as payroll_router
+from app.routers.salary_slips import router as salary_slips_router
 
 app = FastAPI(
     title="HRMS API",
@@ -27,6 +30,8 @@ app.include_router(auth_router)
 app.include_router(employee_router)
 app.include_router(attendance_router)
 app.include_router(leave_router)
+app.include_router(payroll_router)
+app.include_router(salary_slips_router)
 
 
 @app.get("/")
