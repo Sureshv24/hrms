@@ -1,20 +1,27 @@
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+# Database
 from app.db.database import Base, engine
+
+# Models: import before create_all so their tables are registered
 from app.models.user import User
-from app.routers.auth import router as auth_router
 from app.models.employee import Employee
-from app.routers.employees import router as employee_router
 from app.models.attendance import Attendance
-from app.routers.attendance import router as attendance_router
 from app.models.leave import LeaveRequest
 from app.models.leave_balance import LeaveBalance
-from app.routers.leaves import router as leave_router
 from app.models.payroll import Payroll
+
+# API routers
+from app.routers.auth import router as auth_router
+from app.routers.employees import router as employee_router
+from app.routers.attendance import router as attendance_router
+from app.routers.leaves import router as leave_router
 from app.routers.payroll import router as payroll_router
 from app.routers.salary_slips import router as salary_slips_router
+
 
 app = FastAPI(
     title="HRMS API",
@@ -22,10 +29,26 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Create database tables for initial development
+
+# Allow the local React frontend to call the FastAPI backend.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Initial development setup.
+# Use Alembic migrations for production schema management.
 Base.metadata.create_all(bind=engine)
 
-# Register authentication routes
+
+# Register API routers
 app.include_router(auth_router)
 app.include_router(employee_router)
 app.include_router(attendance_router)
