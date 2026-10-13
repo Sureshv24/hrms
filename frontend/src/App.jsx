@@ -3,6 +3,11 @@ import { useEffect, useState } from "react";
 import {
   Activity,
   ArrowRight,
+  ClipboardList,
+  Search,
+  RotateCcw,
+  ChevronLeft,
+  ChevronRight,
   CalendarDays,
   CheckCircle2,
   Clock3,
@@ -134,6 +139,18 @@ const initialLeaveForm = () => ({
   reason: "",
 });
 
+const initialAuditFilters = () => ({
+  actor_user_id: "",
+  actor_name: "",
+  action: "",
+  entity_type: "",
+  entity_id: "",
+  start_date: "",
+  end_date: "",
+});
+
+const AUDIT_PAGE_SIZE = 10;
+
 const emptyDashboard = {
   employee: null,
   employees: [],
@@ -180,6 +197,14 @@ function App() {
     address: "",
   });
 
+  // Read-only audit history and server-side filters/pagination.
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditLoaded, setAuditLoaded] = useState(false);
+  const [auditSkip, setAuditSkip] = useState(0);
+  const [auditHasNext, setAuditHasNext] = useState(false);
+  const [auditFilters, setAuditFilters] = useState(initialAuditFilters);
+
   const isManagement = ["Admin", "HR"].includes(user?.role);
   const currentMonth = new Date().getMonth() + 1;
   const currentYear = new Date().getFullYear();
@@ -190,6 +215,7 @@ function App() {
         { label: "Employees", icon: Users },
         { label: "Leave Management", icon: CalendarDays },
         { label: "Payroll", icon: Wallet },
+        { label: "Audit Logs", icon: ClipboardList },
       ]
     : [
         { label: "Dashboard", icon: LayoutDashboard },
@@ -393,6 +419,78 @@ function App() {
     setMobileMenuOpen(false);
     setNotice("");
     setError("");
+
+    if (page === "Audit Logs" && isManagement) {
+      void loadAuditLogs(0, auditFilters);
+    }
+  }
+
+  async function loadAuditLogs(skipValue = auditSkip, filters = auditFilters) {
+    if (!isManagement) return;
+
+    setAuditLoading(true);
+    setError("");
+
+    try {
+      const params = {
+        skip: skipValue,
+        limit: AUDIT_PAGE_SIZE,
+      };
+
+      if (String(filters.actor_user_id || "").trim()) {
+        params.actor_user_id = Number(filters.actor_user_id);
+      }
+      if (String(filters.actor_name || "").trim()) {
+        params.actor_name = filters.actor_name.trim();
+      }
+      if (String(filters.action || "").trim()) {
+        params.action = filters.action.trim();
+      }
+      if (String(filters.entity_type || "").trim()) {
+        params.entity_type = filters.entity_type.trim();
+      }
+      if (String(filters.entity_id || "").trim()) {
+        params.entity_id = filters.entity_id.trim();
+      }
+      if (filters.start_date) params.start_date = filters.start_date;
+      if (filters.end_date) params.end_date = filters.end_date;
+
+      const response = await api.get("/audit-logs/", { params });
+
+      if (!Array.isArray(response.data)) {
+        throw new Error("The audit logs API returned an unexpected response.");
+      }
+
+      setAuditLogs(response.data);
+      setAuditSkip(skipValue);
+      setAuditHasNext(response.data.length === AUDIT_PAGE_SIZE);
+      setAuditLoaded(true);
+    } catch (err) {
+      setAuditLogs([]);
+      setAuditHasNext(false);
+      setAuditLoaded(true);
+      setError(messageFromError(err));
+    } finally {
+      setAuditLoading(false);
+    }
+  }
+
+  async function handleAuditFilterSubmit(event) {
+    event.preventDefault();
+    await loadAuditLogs(0, auditFilters);
+  }
+
+  function resetAuditFilters() {
+    const clearedFilters = initialAuditFilters();
+    setAuditFilters(clearedFilters);
+    void loadAuditLogs(0, clearedFilters);
+  }
+
+  function handleAuditFilterChange(field, value) {
+    setAuditFilters((previous) => ({
+      ...previous,
+      [field]: value,
+    }));
   }
 
   async function runAction(action, successMessage) {
@@ -937,13 +1035,17 @@ function App() {
 
             <button
               className="refresh-button"
-              onClick={loadDashboard}
-              disabled={loading}
-              title="Refresh dashboard"
+              onClick={() =>
+                activePage === "Audit Logs"
+                  ? loadAuditLogs(auditSkip, auditFilters)
+                  : loadDashboard()
+              }
+              disabled={loading || auditLoading}
+              title={activePage === "Audit Logs" ? "Refresh audit logs" : "Refresh dashboard"}
             >
               <RefreshCw
                 size={17}
-                className={loading ? "spin-animation" : ""}
+                className={loading || auditLoading ? "spin-animation" : ""}
               />
 
               <span>Refresh</span>
@@ -2035,6 +2137,281 @@ function App() {
                 </div>
               </section>
             </>
+          )}
+
+          {activePage === "Audit Logs" && isManagement && (
+            <div className="audit-page-stack">
+              <section className="audit-hero">
+                <div className="audit-hero-content">
+                  <span className="audit-kicker">SECURITY &amp; COMPLIANCE</span>
+                  <h2>Audit trail</h2>
+                  <p>
+                    Review administrative and system activity across employees,
+                    leave requests, attendance, and payroll.
+                  </p>
+                  <span className="audit-readonly-chip">
+                    <ShieldCheck size={15} />
+                    Read-only audit access
+                  </span>
+                </div>
+                <div className="audit-hero-art" aria-hidden="true">
+                  <span className="audit-orbit audit-orbit-one" />
+                  <span className="audit-orbit audit-orbit-two" />
+                  <span className="audit-hero-icon">
+                    <ClipboardList size={38} />
+                  </span>
+                </div>
+              </section>
+
+              <section className="audit-metrics-grid" aria-label="Audit summary">
+                <article className="audit-metric-card">
+                  <span className="audit-metric-icon audit-metric-purple">
+                    <ClipboardList size={20} />
+                  </span>
+                  <div className="audit-metric-copy">
+                    <span>Events on this page</span>
+                    <strong>{auditLogs.length}</strong>
+                    <small>Up to {AUDIT_PAGE_SIZE} records per page</small>
+                  </div>
+                </article>
+                <article className="audit-metric-card">
+                  <span className="audit-metric-icon audit-metric-cyan">
+                    <ShieldCheck size={20} />
+                  </span>
+                  <div className="audit-metric-copy">
+                    <span>Access level</span>
+                    <strong>{user.role}</strong>
+                    <small>Authorized management access</small>
+                  </div>
+                </article>
+                <article className="audit-metric-card">
+                  <span className="audit-metric-icon audit-metric-blue">
+                    <Activity size={20} />
+                  </span>
+                  <div className="audit-metric-copy">
+                    <span>Current page</span>
+                    <strong>{Math.floor(auditSkip / AUDIT_PAGE_SIZE) + 1}</strong>
+                    <small>Newest events appear first</small>
+                  </div>
+                </article>
+              </section>
+
+              <section className="content-card audit-filter-card">
+                <div className="section-heading">
+                  <div>
+                    <h2>Filter audit events</h2>
+                    <p>
+                      Narrow the history by actor, action, record type, or date.
+                    </p>
+                  </div>
+                  <div className="section-heading-icon">
+                    <Search size={20} />
+                  </div>
+                </div>
+
+                <form className="data-form audit-filter-grid" onSubmit={handleAuditFilterSubmit}>
+                  <label className="form-field">
+                    <span>Actor user ID</span>
+                    <input
+                      type="number"
+                      min="1"
+                      value={auditFilters.actor_user_id}
+                      onChange={(event) => handleAuditFilterChange("actor_user_id", event.target.value)}
+                      placeholder="Any user"
+                    />
+                  </label>
+
+                  <label className="form-field">
+                    <span>Actor name</span>
+                    <input
+                      type="text"
+                      maxLength="150"
+                      value={auditFilters.actor_name}
+                      onChange={(event) => handleAuditFilterChange("actor_name", event.target.value)}
+                      placeholder="e.g. magesh"
+                    />
+                  </label>
+
+                  <label className="form-field">
+                    <span>Action</span>
+                    <input
+                      type="text"
+                      maxLength="100"
+                      value={auditFilters.action}
+                      onChange={(event) => handleAuditFilterChange("action", event.target.value)}
+                      placeholder="e.g. payroll.credit_simulated"
+                    />
+                  </label>
+
+                  <label className="form-field">
+                    <span>Entity type</span>
+                    <select
+                      value={auditFilters.entity_type}
+                      onChange={(event) => handleAuditFilterChange("entity_type", event.target.value)}
+                    >
+                      <option value="">All entities</option>
+                      <option value="employee">Employee</option>
+                      <option value="attendance">Attendance</option>
+                      <option value="leave">Leave</option>
+                      <option value="payroll">Payroll</option>
+                      <option value="user">User</option>
+                    </select>
+                  </label>
+
+                  <label className="form-field">
+                    <span>Entity ID</span>
+                    <input
+                      type="text"
+                      maxLength="50"
+                      value={auditFilters.entity_id}
+                      onChange={(event) => handleAuditFilterChange("entity_id", event.target.value)}
+                      placeholder="e.g. 2"
+                    />
+                  </label>
+
+                  <label className="form-field">
+                    <span>Start date</span>
+                    <input
+                      type="date"
+                      value={auditFilters.start_date}
+                      onChange={(event) => handleAuditFilterChange("start_date", event.target.value)}
+                    />
+                  </label>
+
+                  <label className="form-field">
+                    <span>End date</span>
+                    <input
+                      type="date"
+                      value={auditFilters.end_date}
+                      min={auditFilters.start_date || undefined}
+                      onChange={(event) => handleAuditFilterChange("end_date", event.target.value)}
+                    />
+                  </label>
+
+                  <div className="form-actions audit-filter-actions">
+                    <button className="primary-button" type="submit" disabled={auditLoading}>
+                      <Search size={16} />
+                      Apply filters
+                    </button>
+                    <button className="secondary-button" type="button" onClick={resetAuditFilters} disabled={auditLoading}>
+                      <RotateCcw size={16} />
+                      Reset
+                    </button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="content-card audit-results-card">
+                <div className="section-heading audit-results-heading">
+                  <div>
+                    <h2>Audit history</h2>
+                    <p>All entries are displayed newest first. This page cannot modify audit records.</p>
+                  </div>
+                  <span className="audit-readonly-label">
+                    <ShieldCheck size={14} /> Read only
+                  </span>
+                </div>
+
+                {auditLoading ? (
+                  <div className="audit-loading-state">
+                    <span className="loading-spinner" />
+                    <span>Loading audit history...</span>
+                  </div>
+                ) : auditLogs.length === 0 ? (
+                  <EmptyState
+                    title={auditLoaded ? "No audit entries found" : "Loading audit history"}
+                    description={auditLoaded
+                      ? "Try changing or clearing the filters to see more events."
+                      : "Audit entries will appear here after the request completes."}
+                  />
+                ) : (
+                  <>
+                    <div className="table-wrap audit-table-wrap">
+                      <table className="data-table audit-table">
+                        <thead>
+                          <tr>
+                            <th>Event</th>
+                            <th>Actor</th>
+                            <th>Action</th>
+                            <th>Affected record</th>
+                            <th>Date &amp; time</th>
+                            <th>Details</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {auditLogs.map((entry) => (
+                            <tr key={entry.id}>
+                              <td>
+                                <div className="table-primary">#{entry.id}</div>
+                                <div className="table-secondary">Audit event</div>
+                              </td>
+                              <td>
+                                <div className="table-primary">{entry.actor_name || "System"}</div>
+                                <div className="table-secondary">
+                                  {entry.actor_role || "System"}
+                                  {entry.actor_user_id != null ? ` · User #${entry.actor_user_id}` : " · No user ID"}
+                                </div>
+                              </td>
+                              <td>
+                                <code className="audit-action-code">{entry.action}</code>
+                              </td>
+                              <td>
+                                <span className={`audit-entity-pill audit-entity-${String(entry.entity_type || "other").toLowerCase()}`}>
+                                  {entry.entity_type || "unknown"}
+                                </span>
+                                <div className="table-secondary audit-entity-id">
+                                  {entry.entity_id ? `Record #${entry.entity_id}` : "No record ID"}
+                                </div>
+                              </td>
+                              <td>
+                                <div className="audit-time-date">{formatDate(entry.created_at)}</div>
+                                <div className="table-secondary">{formatTime(entry.created_at)}</div>
+                              </td>
+                              <td>
+                                {entry.details && Object.keys(entry.details).length > 0 ? (
+                                  <details className="audit-details">
+                                    <summary>View details</summary>
+                                    <pre>{JSON.stringify(entry.details, null, 2)}</pre>
+                                  </details>
+                                ) : (
+                                  <span className="audit-no-details">No details</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="audit-pagination">
+                      <span className="audit-page-indicator">
+                        Page {Math.floor(auditSkip / AUDIT_PAGE_SIZE) + 1}
+                        <span> · </span>
+                        {auditLogs.length} {auditLogs.length === 1 ? "event" : "events"} shown
+                      </span>
+                      <div className="audit-pagination-actions">
+                        <button
+                          className="secondary-button audit-page-button"
+                          type="button"
+                          onClick={() => loadAuditLogs(Math.max(0, auditSkip - AUDIT_PAGE_SIZE), auditFilters)}
+                          disabled={auditSkip === 0 || auditLoading}
+                        >
+                          <ChevronLeft size={16} /> Previous
+                        </button>
+                        <button
+                          className="secondary-button audit-page-button"
+                          type="button"
+                          onClick={() => loadAuditLogs(auditSkip + AUDIT_PAGE_SIZE, auditFilters)}
+                          disabled={!auditHasNext || auditLoading}
+                        >
+                          Next <ChevronRight size={16} />
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </section>
+            </div>
           )}
 
           <footer className="app-footer">

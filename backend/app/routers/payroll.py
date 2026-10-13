@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.permissions import require_roles
@@ -17,6 +17,8 @@ from app.models.payroll import Payroll
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.payroll import PayrollResponse
+from app.utils.audit import record_audit_log
+
 
 router = APIRouter(prefix="/payroll", tags=["Payroll"])
 
@@ -27,7 +29,10 @@ def money(value: Decimal) -> Decimal:
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
-def get_payroll_or_404(payroll_id: int, db: Session) -> Payroll:
+def get_payroll_or_404(
+    payroll_id: int,
+    db: Session,
+) -> Payroll:
     payroll = (
         db.query(Payroll)
         .filter(Payroll.id == payroll_id)
@@ -35,7 +40,10 @@ def get_payroll_or_404(payroll_id: int, db: Session) -> Payroll:
     )
 
     if payroll is None:
-        raise HTTPException(status_code=404, detail="Payroll not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Payroll not found",
+        )
 
     return payroll
 
@@ -68,7 +76,8 @@ def calculate_lop_for_month(
             continue
 
         # The leave workflow consumes paid leave first.
-        # Therefore, LOP days are treated as the last days of the request.
+        # Therefore, LOP days are treated as the last days
+        # of the leave request.
         lop_start = leave.end_date - timedelta(days=days - 1)
 
         overlap_start = max(lop_start, month_start)
@@ -90,7 +99,9 @@ def generate_payroll(
     month: int = Query(..., ge=1, le=12),
     year: int = Query(..., ge=2000, le=2100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     employee = (
         db.query(Employee)
@@ -99,7 +110,10 @@ def generate_payroll(
     )
 
     if employee is None:
-        raise HTTPException(status_code=404, detail="Employee not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found",
+        )
 
     existing = (
         db.query(Payroll)
@@ -114,11 +128,17 @@ def generate_payroll(
     if existing:
         raise HTTPException(
             status_code=409,
-            detail="Payroll already exists for this employee and month",
+            detail=(
+                "Payroll already exists for this employee and month"
+            ),
         )
 
     month_start = date(year, month, 1)
-    month_end = date(year, month, monthrange(year, month)[1])
+    month_end = date(
+        year,
+        month,
+        monthrange(year, month)[1],
+    )
 
     attendance_count = (
         db.query(func.count(Attendance.id))
@@ -165,22 +185,60 @@ def generate_payroll(
         generated_by=current_user.id,
     )
 
-    db.add(payroll)
-
     try:
+        db.add(payroll)
+
+        # Generate the payroll ID before writing its audit event.
+        db.flush()
+
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="payroll.generated",
+            entity_type="payroll",
+            entity_id=payroll.id,
+            details={
+                "employee_id": employee_id,
+                "month": month,
+                "year": year,
+                "present_days": int(attendance_count),
+                "lop_days": lop_days,
+                "gross_salary": str(gross_salary),
+                "lop_deduction": str(lop_deduction),
+                "net_salary": str(net_salary),
+                "status": "Generated",
+            },
+        )
+
+        # Payroll and its audit event are committed together.
         db.commit()
         db.refresh(payroll)
-    except IntegrityError:
+
+    except IntegrityError as exc:
         db.rollback()
+
         raise HTTPException(
             status_code=409,
-            detail="Payroll already exists for this employee and month",
-        )
+            detail=(
+                "Payroll already exists for this employee and month"
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to generate payroll",
+        ) from exc
 
     return payroll
 
 
-@router.get("/me", response_model=list[PayrollResponse])
+@router.get(
+    "/me",
+    response_model=list[PayrollResponse],
+)
 def my_payroll_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -200,17 +258,25 @@ def my_payroll_history(
     return (
         db.query(Payroll)
         .filter(Payroll.employee_id == employee.id)
-        .order_by(Payroll.year.desc(), Payroll.month.desc())
+        .order_by(
+            Payroll.year.desc(),
+            Payroll.month.desc(),
+        )
         .all()
     )
 
 
-@router.get("/", response_model=list[PayrollResponse])
+@router.get(
+    "/",
+    response_model=list[PayrollResponse],
+)
 def list_payroll(
     month: int | None = Query(default=None, ge=1, le=12),
     year: int | None = Query(default=None, ge=2000, le=2100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     query = db.query(Payroll)
 
@@ -220,14 +286,21 @@ def list_payroll(
     if year is not None:
         query = query.filter(Payroll.year == year)
 
-    return query.order_by(
-        Payroll.year.desc(),
-        Payroll.month.desc(),
-        Payroll.employee_id,
-    ).all()
+    return (
+        query
+        .order_by(
+            Payroll.year.desc(),
+            Payroll.month.desc(),
+            Payroll.employee_id,
+        )
+        .all()
+    )
 
 
-@router.get("/{payroll_id}", response_model=PayrollResponse)
+@router.get(
+    "/{payroll_id}",
+    response_model=PayrollResponse,
+)
 def get_payroll(
     payroll_id: int,
     db: Session = Depends(get_db),
@@ -243,16 +316,24 @@ def get_payroll(
         )
 
         if employee is None or payroll.employee_id != employee.id:
-            raise HTTPException(status_code=404, detail="Payroll not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Payroll not found",
+            )
 
     return payroll
 
 
-@router.post("/{payroll_id}/lock", response_model=PayrollResponse)
+@router.post(
+    "/{payroll_id}/lock",
+    response_model=PayrollResponse,
+)
 def lock_payroll(
     payroll_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     payroll = get_payroll_or_404(payroll_id, db)
 
@@ -264,19 +345,51 @@ def lock_payroll(
 
     payroll.is_locked = True
     payroll.status = "Locked"
-    payroll.locked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    payroll.locked_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
-    db.commit()
-    db.refresh(payroll)
+    try:
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="payroll.locked",
+            entity_type="payroll",
+            entity_id=payroll.id,
+            details={
+                "employee_id": payroll.employee_id,
+                "month": payroll.month,
+                "year": payroll.year,
+                "net_salary": str(payroll.net_salary),
+                "status": "Locked",
+            },
+        )
+
+        # Payroll locking and the audit event are atomic.
+        db.commit()
+        db.refresh(payroll)
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to lock payroll",
+        ) from exc
 
     return payroll
 
 
-@router.post("/{payroll_id}/credit", response_model=PayrollResponse)
+@router.post(
+    "/{payroll_id}/credit",
+    response_model=PayrollResponse,
+)
 def simulate_salary_credit(
     payroll_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     payroll = get_payroll_or_404(payroll_id, db)
 
@@ -292,11 +405,39 @@ def simulate_salary_credit(
             detail="Salary credit has already been simulated",
         )
 
-    # Simulation only: no bank transfer or payment gateway is used.
+    # Simulation only. No bank transfer or payment gateway is used.
     payroll.status = "Paid"
-    payroll.paid_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    payroll.paid_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
-    db.commit()
-    db.refresh(payroll)
+    try:
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="payroll.credit_simulated",
+            entity_type="payroll",
+            entity_id=payroll.id,
+            details={
+                "employee_id": payroll.employee_id,
+                "month": payroll.month,
+                "year": payroll.year,
+                "net_salary": str(payroll.net_salary),
+                "status": "Paid",
+                "payment_type": "simulation_only",
+            },
+        )
+
+        # Status change and audit event are committed together.
+        db.commit()
+        db.refresh(payroll)
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to simulate salary credit",
+        ) from exc
 
     return payroll

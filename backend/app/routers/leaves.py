@@ -2,6 +2,7 @@
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.permissions import require_roles
@@ -17,10 +18,15 @@ from app.schemas.leave import (
     LeaveResponse,
     LeaveReviewRequest,
 )
+from app.utils.audit import record_audit_log
 
-router = APIRouter(prefix="/leaves", tags=["Leave Management"])
 
-# Example company policy. Adjust these values to match your requirements.
+router = APIRouter(
+    prefix="/leaves",
+    tags=["Leave Management"],
+)
+
+# Example company policy. Adjust these values as needed.
 DEFAULT_BALANCES = {
     "Casual": 12,
     "Sick": 12,
@@ -76,9 +82,12 @@ def get_or_create_balance(
     return balance
 
 
-def calculate_leave_days(start_date: date, end_date: date) -> int:
+def calculate_leave_days(
+    start_date: date,
+    end_date: date,
+) -> int:
     # Counts calendar days, including the first and last day.
-    # Weekend/holiday exclusions can be added using company policy.
+    # Weekend and holiday exclusions can be added using company policy.
     return (end_date - start_date).days + 1
 
 
@@ -120,7 +129,10 @@ def apply_leave(
     if overlapping:
         raise HTTPException(
             status_code=409,
-            detail="A pending or approved leave already overlaps these dates",
+            detail=(
+                "A pending or approved leave already overlaps "
+                "these dates"
+            ),
         )
 
     leave = LeaveRequest(
@@ -133,14 +145,43 @@ def apply_leave(
         lop_days=0,
     )
 
-    db.add(leave)
-    db.commit()
-    db.refresh(leave)
+    try:
+        db.add(leave)
+        db.flush()
+
+        # Record the application in the same transaction.
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="leave.applied",
+            entity_type="leave",
+            entity_id=leave.id,
+            details={
+                "employee_id": employee.id,
+                "leave_type": leave.leave_type,
+                "start_date": leave.start_date.isoformat(),
+                "end_date": leave.end_date.isoformat(),
+                "status": "Pending",
+            },
+        )
+
+        db.commit()
+        db.refresh(leave)
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to submit leave request",
+        ) from exc
 
     return leave
 
 
-@router.get("/me", response_model=list[LeaveResponse])
+@router.get(
+    "/me",
+    response_model=list[LeaveResponse],
+)
 def my_leave_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -165,9 +206,13 @@ def my_leave_balances(
 ):
     employee = get_active_employee(db, current_user.id)
 
-    # Initialize missing balance rows for this employee.
+    # Initialize any missing balance rows.
     for leave_type in DEFAULT_BALANCES:
-        get_or_create_balance(db, employee.id, leave_type)
+        get_or_create_balance(
+            db,
+            employee.id,
+            leave_type,
+        )
 
     db.commit()
 
@@ -179,32 +224,50 @@ def my_leave_balances(
     )
 
 
-@router.get("/", response_model=list[LeaveResponse])
+@router.get(
+    "/",
+    response_model=list[LeaveResponse],
+)
 def list_leave_requests(
     leave_status: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     query = db.query(LeaveRequest)
 
     if leave_status is not None:
-        if leave_status not in ["Pending", "Approved", "Rejected"]:
+        if leave_status not in [
+            "Pending",
+            "Approved",
+            "Rejected",
+        ]:
             raise HTTPException(
                 status_code=400,
                 detail="Invalid leave status",
             )
 
-        query = query.filter(LeaveRequest.status == leave_status)
+        query = query.filter(
+            LeaveRequest.status == leave_status
+        )
 
-    return query.order_by(LeaveRequest.created_at.desc()).all()
+    return query.order_by(
+        LeaveRequest.created_at.desc()
+    ).all()
 
 
-@router.patch("/{leave_id}/review", response_model=LeaveResponse)
+@router.patch(
+    "/{leave_id}/review",
+    response_model=LeaveResponse,
+)
 def review_leave(
     leave_id: int,
     data: LeaveReviewRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_roles("Admin", "HR")),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
 ):
     leave = (
         db.query(LeaveRequest)
@@ -225,48 +288,88 @@ def review_leave(
             detail="This leave request has already been reviewed",
         )
 
-    leave.reviewed_by = current_user.id
-    leave.reviewed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    if data.action == "reject":
-        leave.status = "Rejected"
-        leave.lop_days = 0
-    else:
-        leave_days = calculate_leave_days(
-            leave.start_date,
-            leave.end_date,
+    if data.action not in ["approve", "reject"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Action must be approve or reject",
         )
 
-        if leave.leave_type == "Unpaid":
-            leave.lop_days = leave_days
-        else:
-            balance = get_or_create_balance(
-                db,
-                leave.employee_id,
-                leave.leave_type,
-            )
-
-            available_days = max(
-                0,
-                balance.total_days - balance.used_days,
-            )
-
-            paid_days = min(leave_days, available_days)
-            balance.used_days += paid_days
-
-            # Any approved days beyond the remaining allowance become LOP.
-            leave.lop_days = leave_days - paid_days
-
-        leave.status = "Approved"
+    leave.reviewed_by = current_user.id
+    leave.reviewed_at = (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
     try:
+        if data.action == "reject":
+            leave.status = "Rejected"
+            leave.lop_days = 0
+
+        else:
+            leave_days = calculate_leave_days(
+                leave.start_date,
+                leave.end_date,
+            )
+
+            if leave.leave_type == "Unpaid":
+                leave.lop_days = leave_days
+
+            else:
+                balance = get_or_create_balance(
+                    db,
+                    leave.employee_id,
+                    leave.leave_type,
+                )
+
+                available_days = max(
+                    0,
+                    balance.total_days - balance.used_days,
+                )
+
+                paid_days = min(
+                    leave_days,
+                    available_days,
+                )
+
+                balance.used_days += paid_days
+
+                # Approved days above the available paid balance
+                # are treated as Loss of Pay.
+                leave.lop_days = leave_days - paid_days
+
+            leave.status = "Approved"
+
+        # Log the final decision and resulting LOP days.
+        # No personal leave reason is copied into the audit log.
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action=(
+                "leave.approved"
+                if data.action == "approve"
+                else "leave.rejected"
+            ),
+            entity_type="leave",
+            entity_id=leave.id,
+            details={
+                "employee_id": leave.employee_id,
+                "leave_type": leave.leave_type,
+                "start_date": leave.start_date.isoformat(),
+                "end_date": leave.end_date.isoformat(),
+                "status": leave.status,
+                "lop_days": leave.lop_days,
+            },
+        )
+
+        # Leave decision, balance changes, and audit entry
+        # are committed together.
         db.commit()
         db.refresh(leave)
-    except Exception:
+
+    except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(
             status_code=500,
             detail="Unable to process leave review",
-        )
+        ) from exc
 
     return leave

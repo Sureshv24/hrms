@@ -21,6 +21,8 @@ from app.routers.attendance import router as attendance_router
 from app.routers.leaves import router as leave_router
 from app.routers.payroll import router as payroll_router
 from app.routers.salary_slips import router as salary_slips_router
+from app.models.audit_log import AuditLog
+from app.routers.audit_logs import router as audit_logs_router
 
 
 app = FastAPI(
@@ -55,6 +57,7 @@ app.include_router(attendance_router)
 app.include_router(leave_router)
 app.include_router(payroll_router)
 app.include_router(salary_slips_router)
+app.include_router(audit_logs_router)
 
 
 @app.get("/")
