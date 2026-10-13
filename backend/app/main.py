@@ -23,7 +23,8 @@ from app.routers.payroll import router as payroll_router
 from app.routers.salary_slips import router as salary_slips_router
 from app.models.audit_log import AuditLog
 from app.routers.audit_logs import router as audit_logs_router
-
+from app.models.email_log import EmailLog
+from app.routers.reports import router as reports_router
 
 app = FastAPI(
     title="HRMS API",
@@ -58,6 +59,7 @@ app.include_router(leave_router)
 app.include_router(payroll_router)
 app.include_router(salary_slips_router)
 app.include_router(audit_logs_router)
+app.include_router(reports_router)
 
 
 @app.get("/")

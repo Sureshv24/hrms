@@ -1,4 +1,4 @@
-
+import logging
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,8 +18,13 @@ from app.schemas.leave import (
     LeaveResponse,
     LeaveReviewRequest,
 )
+from app.services.email_service import (
+    send_leave_notification_email,
+)
 from app.utils.audit import record_audit_log
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/leaves",
@@ -35,7 +40,10 @@ DEFAULT_BALANCES = {
 }
 
 
-def get_active_employee(db: Session, user_id: int) -> Employee:
+def get_active_employee(
+    db: Session,
+    user_id: int,
+) -> Employee:
     employee = (
         db.query(Employee)
         .filter(
@@ -47,7 +55,7 @@ def get_active_employee(db: Session, user_id: int) -> Employee:
 
     if not employee:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Active employee record not found",
         )
 
@@ -86,9 +94,77 @@ def calculate_leave_days(
     start_date: date,
     end_date: date,
 ) -> int:
-    # Counts calendar days, including the first and last day.
-    # Weekend and holiday exclusions can be added using company policy.
+    # Counts calendar days, including both the first and last day.
+    # Weekend and holiday exclusions depend on company policy.
     return (end_date - start_date).days + 1
+
+
+def notify_leave_owner_safely(
+    db: Session,
+    recipient: User,
+    leave: LeaveRequest,
+) -> None:
+    """
+    Notify the employee after the leave transaction is committed.
+
+    Email delivery failure must not undo an already-saved leave
+    application, approval, rejection, or leave balance update.
+    """
+
+    if not recipient.email:
+        logger.warning(
+            "Leave notification skipped: recipient email missing "
+            "for leave_id=%s",
+            leave.id,
+        )
+        return
+
+    try:
+        email_status = send_leave_notification_email(
+            db=db,
+            recipient_email=recipient.email,
+            employee_name=recipient.full_name,
+            leave_type=leave.leave_type,
+            start_date=leave.start_date,
+            end_date=leave.end_date,
+            leave_status=leave.status,
+            leave_id=leave.id,
+        )
+
+        if email_status != "sent":
+            logger.warning(
+                "Leave notification status=%s for leave_id=%s",
+                email_status,
+                leave.id,
+            )
+
+    except Exception:
+        logger.exception(
+            "Unable to process leave notification for leave_id=%s",
+            leave.id,
+        )
+
+
+def get_leave_owner(
+    db: Session,
+    employee_id: int,
+) -> User | None:
+    """Find the user account linked to a leave request's employee."""
+
+    employee = (
+        db.query(Employee)
+        .filter(Employee.id == employee_id)
+        .first()
+    )
+
+    if employee is None:
+        return None
+
+    return (
+        db.query(User)
+        .filter(User.id == employee.user_id)
+        .first()
+    )
 
 
 @router.post(
@@ -103,17 +179,20 @@ def apply_leave(
 ):
     if data.end_date < data.start_date:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="End date cannot be before start date",
         )
 
     if data.start_date < date.today():
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Leave cannot start in the past",
         )
 
-    employee = get_active_employee(db, current_user.id)
+    employee = get_active_employee(
+        db,
+        current_user.id,
+    )
 
     overlapping = (
         db.query(LeaveRequest)
@@ -128,7 +207,7 @@ def apply_leave(
 
     if overlapping:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail=(
                 "A pending or approved leave already overlaps "
                 "these dates"
@@ -149,7 +228,7 @@ def apply_leave(
         db.add(leave)
         db.flush()
 
-        # Record the application in the same transaction.
+        # Record leave application in the same transaction.
         record_audit_log(
             db=db,
             actor=current_user,
@@ -165,15 +244,25 @@ def apply_leave(
             },
         )
 
+        # Save leave request and audit entry atomically.
         db.commit()
         db.refresh(leave)
 
     except SQLAlchemyError as exc:
         db.rollback()
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to submit leave request",
         ) from exc
+
+    # Send application confirmation only after the leave has
+    # been successfully saved.
+    notify_leave_owner_safely(
+        db=db,
+        recipient=current_user,
+        leave=leave,
+    )
 
     return leave
 
@@ -186,7 +275,10 @@ def my_leave_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    employee = get_active_employee(db, current_user.id)
+    employee = get_active_employee(
+        db,
+        current_user.id,
+    )
 
     return (
         db.query(LeaveRequest)
@@ -204,9 +296,12 @@ def my_leave_balances(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    employee = get_active_employee(db, current_user.id)
+    employee = get_active_employee(
+        db,
+        current_user.id,
+    )
 
-    # Initialize any missing balance rows.
+    # Initialize missing balance rows for this employee.
     for leave_type in DEFAULT_BALANCES:
         get_or_create_balance(
             db,
@@ -214,7 +309,15 @@ def my_leave_balances(
             leave_type,
         )
 
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to retrieve leave balances",
+        ) from exc
 
     return (
         db.query(LeaveBalance)
@@ -244,7 +347,7 @@ def list_leave_requests(
             "Rejected",
         ]:
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid leave status",
             )
 
@@ -278,21 +381,28 @@ def review_leave(
 
     if leave is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Leave request not found",
         )
 
     if leave.status != "Pending":
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail="This leave request has already been reviewed",
         )
 
     if data.action not in ["approve", "reject"]:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Action must be approve or reject",
         )
+
+    # Find the employee's account before making the decision.
+    # The notification will be sent only after commit succeeds.
+    leave_owner = get_leave_owner(
+        db=db,
+        employee_id=leave.employee_id,
+    )
 
     leave.reviewed_by = current_user.id
     leave.reviewed_at = (
@@ -332,14 +442,13 @@ def review_leave(
 
                 balance.used_days += paid_days
 
-                # Approved days above the available paid balance
-                # are treated as Loss of Pay.
+                # Approved leave above the available paid balance
+                # becomes Loss of Pay.
                 leave.lop_days = leave_days - paid_days
 
             leave.status = "Approved"
 
-        # Log the final decision and resulting LOP days.
-        # No personal leave reason is copied into the audit log.
+        # Preserve the existing audit workflow.
         record_audit_log(
             db=db,
             actor=current_user,
@@ -360,16 +469,32 @@ def review_leave(
             },
         )
 
-        # Leave decision, balance changes, and audit entry
-        # are committed together.
+        # Leave decision, balance updates, and audit log are
+        # committed together.
         db.commit()
         db.refresh(leave)
 
     except SQLAlchemyError as exc:
         db.rollback()
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to process leave review",
         ) from exc
+
+    # Notify the employee about the final decision.
+    # Notification failures must not undo the decision.
+    if leave_owner is not None:
+        notify_leave_owner_safely(
+            db=db,
+            recipient=leave_owner,
+            leave=leave,
+        )
+    else:
+        logger.warning(
+            "Leave decision saved but employee account was not "
+            "found for leave_id=%s",
+            leave.id,
+        )
 
     return leave
