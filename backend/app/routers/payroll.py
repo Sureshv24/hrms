@@ -1,7 +1,7 @@
 import logging
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,6 +27,7 @@ router = APIRouter(prefix="/payroll", tags=["Payroll"])
 
 CENT = Decimal("0.01")
 DAILY_SALARY_BASIS = Decimal("30")
+ZERO_MONEY = Decimal("0.00")
 
 
 class PayrollAdjustmentRequest(BaseModel):
@@ -41,8 +42,13 @@ class PayrollAdjustmentRequest(BaseModel):
 
 
 def money(value: Decimal) -> Decimal:
-    """Round a monetary value to two decimal places."""
+    """Return a monetary value rounded to two decimal places."""
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def get_period_dates(year: int, month: int) -> tuple[date, date]:
+    """Return the first and last calendar dates for a payroll month."""
+    return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
 
 def get_payroll_or_404(payroll_id: int, db: Session) -> Payroll:
@@ -55,8 +61,39 @@ def get_payroll_or_404(payroll_id: int, db: Session) -> Payroll:
     return payroll
 
 
+def get_employee_for_payroll_or_404(employee_id: int, db: Session) -> Employee:
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if employee is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found",
+        )
+    return employee
+
+
+def validate_payroll_period_for_employee(
+    employee: Employee,
+    year: int,
+    month: int,
+) -> tuple[date, date]:
+    """Validate that the payroll period is not before the employee joined."""
+    month_start, month_end = get_period_dates(year, month)
+
+    if employee.joining_date > month_end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot process payroll for {year}-{month:02d}. "
+                f"The employee joined on {employee.joining_date.isoformat()}, "
+                "after this payroll period ended."
+            ),
+        )
+
+    return month_start, month_end
+
+
 def notify_payroll_owner_safely(db: Session, payroll: Payroll) -> None:
-    """Send a payroll email after commit; email failures do not undo payroll."""
+    """Send notification after commit; email failures never undo payroll changes."""
     try:
         employee = (
             db.query(Employee)
@@ -65,7 +102,7 @@ def notify_payroll_owner_safely(db: Session, payroll: Payroll) -> None:
         )
         if employee is None:
             logger.warning(
-                "Payroll notification skipped: employee not found for payroll_id=%s",
+                "Payroll notification skipped: employee missing for payroll_id=%s",
                 payroll.id,
             )
             return
@@ -73,7 +110,7 @@ def notify_payroll_owner_safely(db: Session, payroll: Payroll) -> None:
         user = db.query(User).filter(User.id == employee.user_id).first()
         if user is None or not user.email:
             logger.warning(
-                "Payroll notification skipped: user or email missing for payroll_id=%s",
+                "Payroll notification skipped: user/email missing for payroll_id=%s",
                 payroll.id,
             )
             return
@@ -95,6 +132,9 @@ def notify_payroll_owner_safely(db: Session, payroll: Payroll) -> None:
                 payroll.id,
             )
     except Exception:
+        # Payroll data has already been committed by the caller.
+        # Roll back only any incomplete email-log transaction.
+        db.rollback()
         logger.exception(
             "Unable to process payroll notification for payroll_id=%s",
             payroll.id,
@@ -110,7 +150,7 @@ def iter_dates(start_date: date, end_date: date):
 
 
 def get_working_dates(start_date: date, end_date: date) -> set[date]:
-    """Return Monday-Friday dates; no company holiday calendar is configured."""
+    """Return Monday-Friday dates; a company holiday calendar is not configured."""
     if start_date > end_date:
         return set()
     return {
@@ -126,7 +166,13 @@ def get_approved_leave_impact(
     period_start: date,
     period_end: date,
 ) -> tuple[set[date], set[date]]:
-    """Return weekdays covered by approved leave and dates charged as LOP."""
+    """Return weekdays covered by approved leave and the weekdays charged as LOP.
+
+    The leave-review workflow stores ``lop_days`` as a count of calendar days.
+    For partially-paid approved leave, the workflow treats those LOP days as the
+    final calendar days of the leave interval. Payroll converts those dates to
+    weekdays because unauthorized absences are also counted on weekdays.
+    """
     approved_leave_dates: set[date] = set()
     lop_leave_dates: set[date] = set()
 
@@ -147,6 +193,8 @@ def get_approved_leave_impact(
     for leave in leaves:
         overlap_start = max(leave.start_date, period_start)
         overlap_end = min(leave.end_date, period_end)
+        if overlap_start > overlap_end:
+            continue
 
         for current_date in iter_dates(overlap_start, overlap_end):
             if current_date.weekday() < 5:
@@ -156,8 +204,8 @@ def get_approved_leave_impact(
         if leave_lop_days == 0:
             continue
 
-        # The existing leave workflow treats LOP as the final calendar
-        # days of an approved leave period.
+        # LOP days are assigned to the final calendar days by the existing
+        # leave-review workflow. For Unpaid leave, lop_days spans the full leave.
         lop_start = leave.end_date - timedelta(days=leave_lop_days - 1)
         lop_overlap_start = max(leave.start_date, lop_start, period_start)
         lop_overlap_end = min(leave.end_date, period_end)
@@ -178,7 +226,13 @@ def calculate_payroll_attendance(
     period_end: date,
     month_is_complete: bool,
 ) -> tuple[int, int, int]:
-    """Calculate present days, total LOP days, and unauthorized absences."""
+    """Return (present weekdays, total LOP weekdays, unauthorized absence weekdays).
+
+    For an incomplete month, missing attendance is not yet treated as absence.
+    For a completed month, weekdays with neither attendance nor approved leave
+    are treated as unauthorized absences. Weekends are excluded; company holidays
+    cannot be excluded until a holiday calendar is configured.
+    """
     working_dates = get_working_dates(period_start, period_end)
     if not working_dates:
         return 0, 0, 0
@@ -192,7 +246,9 @@ def calculate_payroll_attendance(
         )
         .all()
     )
-    attendance_dates = {row[0] for row in attendance_rows if row[0] is not None}
+    attendance_dates = {
+        row[0] for row in attendance_rows if row[0] is not None
+    }
     present_dates = attendance_dates.intersection(working_dates)
     present_days = len(present_dates)
 
@@ -202,15 +258,12 @@ def calculate_payroll_attendance(
         period_start=period_start,
         period_end=period_end,
     )
-
-    # Actual attendance takes precedence over leave LOP for the same date.
-    lop_leave_dates.difference_update(attendance_dates)
     approved_leave_workdays = approved_leave_dates.intersection(working_dates)
 
+    # If an employee actually attended on an LOP leave date, do not deduct that day.
+    lop_leave_dates.difference_update(present_dates)
+
     unauthorized_absence_dates: set[date] = set()
-    # In an incomplete current month, do not treat future/missing weekdays
-    # as absences. For a completed month, weekdays without attendance or
-    # approved leave are counted as unauthorized absences.
     if month_is_complete:
         unauthorized_absence_dates = (
             working_dates - present_dates - approved_leave_workdays
@@ -223,31 +276,94 @@ def calculate_payroll_attendance(
     return present_days, total_lop_days, unauthorized_absence_days
 
 
+def calculate_payroll_values(
+    db: Session,
+    employee: Employee,
+    year: int,
+    month: int,
+    monthly_salary: Decimal,
+    as_of_date: date,
+) -> dict[str, Decimal | int | bool]:
+    """Calculate gross salary, attendance, LOP and net salary for a payroll period.
+
+    Gross salary is prorated by calendar days when the employee joins mid-month.
+    LOP deduction uses the project's fixed 30-day salary basis. Attendance-based
+    absence deductions are applied only after the month has ended.
+    """
+    month_start, month_end = get_period_dates(year, month)
+    if employee.joining_date > month_end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot process payroll for {year}-{month:02d}. "
+                f"The employee joined on {employee.joining_date.isoformat()}, "
+                "after this payroll period ended."
+            ),
+        )
+
+    employment_start = max(month_start, employee.joining_date)
+    period_end = min(month_end, as_of_date)
+    if employment_start > period_end:
+        period_start = employment_start
+        present_days, lop_days, unauthorized_absence_days = 0, 0, 0
+    else:
+        period_start = employment_start
+        present_days, lop_days, unauthorized_absence_days = calculate_payroll_attendance(
+            db=db,
+            employee_id=employee.id,
+            period_start=period_start,
+            period_end=period_end,
+            month_is_complete=month_end < as_of_date,
+        )
+
+    calendar_days_in_month = Decimal((month_end - month_start).days + 1)
+    employed_calendar_days = Decimal((month_end - employment_start).days + 1)
+    gross_salary = money(monthly_salary * employed_calendar_days / calendar_days_in_month)
+
+    lop_deduction = money(
+        monthly_salary * Decimal(lop_days) / DAILY_SALARY_BASIS
+    )
+    lop_deduction = min(lop_deduction, gross_salary)
+    net_salary = money(max(ZERO_MONEY, gross_salary - lop_deduction))
+
+    return {
+        "present_days": present_days,
+        "lop_days": lop_days,
+        "unauthorized_absence_days": unauthorized_absence_days,
+        "gross_salary": gross_salary,
+        "lop_deduction": lop_deduction,
+        "net_salary": net_salary,
+        "month_is_complete": month_end < as_of_date,
+    }
+
+
 @router.post(
     "/generate",
     response_model=PayrollResponse,
     status_code=status.HTTP_201_CREATED,
 )
 def generate_payroll(
-    employee_id: int,
+    employee_id: int = Query(..., ge=1),
     month: int = Query(..., ge=1, le=12),
     year: int = Query(..., ge=2000, le=2100),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("Admin", "HR")),
 ):
     today = date.today()
+    employee = get_employee_for_payroll_or_404(employee_id, db)
+    month_start, month_end = validate_payroll_period_for_employee(
+        employee=employee,
+        year=year,
+        month=month,
+    )
 
-    employee = db.query(Employee).filter(Employee.id == employee_id).first()
-    if employee is None:
+    if month_start > today:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Employee not found",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot generate payroll for a future month",
         )
 
-    month_start = date(year, month, 1)
-    month_end = date(year, month, monthrange(year, month)[1])
-
-    # Preserve the existing duplicate-first behavior.
+    # Preserve one payroll record per employee/month/year.
     existing = (
         db.query(Payroll)
         .filter(
@@ -263,65 +379,27 @@ def generate_payroll(
             detail="Payroll already exists for this employee and month",
         )
 
-    if month_start > today:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot generate payroll for a future month",
-        )
-
-    # IMPORTANT: Do not create payroll for a month that ended before
-    # the employee's joining date. This validation must stay inside
-    # generate_payroll(), at the same indentation level as the other checks.
-    joining_date = employee.joining_date
-    if joining_date > month_end:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Cannot generate payroll for {year}-{month:02d}. "
-                f"The employee joined on {joining_date.isoformat()}, "
-                "after this payroll period ended."
-            ),
-        )
-
-    if joining_date > today:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot generate payroll before the employee's joining date",
-        )
-
-    period_start = max(month_start, joining_date)
-    period_end = min(month_end, today)
-    month_is_complete = month_end < today
-
-    attendance_count, lop_days, unauthorized_absence_days = (
-        calculate_payroll_attendance(
-            db=db,
-            employee_id=employee_id,
-            period_start=period_start,
-            period_end=period_end,
-            month_is_complete=month_is_complete,
-        )
-    )
-
     monthly_salary = money(Decimal(str(employee.salary)))
-    gross_salary = monthly_salary
-    lop_deduction = money(
-        monthly_salary * Decimal(lop_days) / DAILY_SALARY_BASIS
+    values = calculate_payroll_values(
+        db=db,
+        employee=employee,
+        year=year,
+        month=month,
+        monthly_salary=monthly_salary,
+        as_of_date=today,
     )
-    lop_deduction = min(lop_deduction, gross_salary)
-    net_salary = money(gross_salary - lop_deduction)
 
     payroll = Payroll(
         employee_id=employee_id,
         month=month,
         year=year,
         monthly_salary=monthly_salary,
-        present_days=attendance_count,
-        lop_days=lop_days,
-        gross_salary=gross_salary,
-        lop_deduction=lop_deduction,
-        net_salary=net_salary,
-        manual_adjustment_amount=Decimal("0.00"),
+        present_days=int(values["present_days"]),
+        lop_days=int(values["lop_days"]),
+        gross_salary=values["gross_salary"],
+        lop_deduction=values["lop_deduction"],
+        net_salary=values["net_salary"],
+        manual_adjustment_amount=ZERO_MONEY,
         status="Generated",
         is_locked=False,
         generated_by=current_user.id,
@@ -341,14 +419,15 @@ def generate_payroll(
                 "employee_id": employee_id,
                 "month": month,
                 "year": year,
-                "present_days": attendance_count,
-                "lop_days": lop_days,
-                "unauthorized_absence_days": unauthorized_absence_days,
-                "gross_salary": str(gross_salary),
-                "lop_deduction": str(lop_deduction),
-                "net_salary": str(net_salary),
+                "present_days": int(values["present_days"]),
+                "lop_days": int(values["lop_days"]),
+                "unauthorized_absence_days": int(values["unauthorized_absence_days"]),
+                "gross_salary": str(values["gross_salary"]),
+                "lop_deduction": str(values["lop_deduction"]),
+                "net_salary": str(values["net_salary"]),
                 "status": "Generated",
-                "absence_deduction_applied": month_is_complete,
+                "month_is_complete": bool(values["month_is_complete"]),
+                "salary_policy": "calendar-day joining proration; 30-day LOP basis",
             },
         )
         db.commit()
@@ -398,6 +477,8 @@ def my_payroll_history(
 def list_payroll(
     month: int | None = Query(default=None, ge=1, le=12),
     year: int | None = Query(default=None, ge=2000, le=2100),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("Admin", "HR")),
 ):
@@ -406,12 +487,15 @@ def list_payroll(
         query = query.filter(Payroll.month == month)
     if year is not None:
         query = query.filter(Payroll.year == year)
+
     return (
         query.order_by(
             Payroll.year.desc(),
             Payroll.month.desc(),
             Payroll.employee_id,
         )
+        .offset(skip)
+        .limit(limit)
         .all()
     )
 
@@ -431,6 +515,7 @@ def get_payroll(
             .first()
         )
         if employee is None or payroll.employee_id != employee.id:
+            # Avoid revealing that another employee's payroll exists.
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Payroll not found",
@@ -457,13 +542,23 @@ def adjust_payroll(
             detail="Payroll not found",
         )
 
-    if payroll.is_locked or payroll.status in ("Locked", "Paid"):
+    if payroll.is_locked or payroll.status != "Generated":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "Cannot adjust locked or paid payroll. "
-                "Only generated, unlocked payroll can be adjusted."
-            ),
+            detail="Cannot adjust locked or paid payroll. Only generated, unlocked payroll can be adjusted.",
+        )
+
+    employee = get_employee_for_payroll_or_404(payroll.employee_id, db)
+    _, month_end = validate_payroll_period_for_employee(
+        employee=employee,
+        year=payroll.year,
+        month=payroll.month,
+    )
+    if month_end < date.today() and employee.joining_date > month_end:
+        # Defensive guard for pre-existing invalid test records.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot adjust payroll for a period before the employee's joining date",
         )
 
     reason = data.reason.strip()
@@ -472,28 +567,27 @@ def adjust_payroll(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Provide a meaningful adjustment reason",
         )
+    if not data.adjustment_amount.is_finite():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Adjustment amount must be a finite number",
+        )
 
     try:
         requested_adjustment = money(data.adjustment_amount)
-        if not requested_adjustment.is_finite():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Adjustment amount must be a finite number",
-            )
-
         previous_adjustment = money(
-            Decimal(str(payroll.manual_adjustment_amount or "0.00"))
+            Decimal(str(payroll.manual_adjustment_amount or ZERO_MONEY))
         )
         previous_net_salary = money(Decimal(str(payroll.net_salary)))
-        gross_salary = Decimal(str(payroll.gross_salary))
-        lop_deduction = Decimal(str(payroll.lop_deduction))
+        gross_salary = money(Decimal(str(payroll.gross_salary)))
+        lop_deduction = money(Decimal(str(payroll.lop_deduction)))
 
-        # Submitted amount replaces the prior adjustment; positive is
-        # an addition and negative is a deduction.
+        # The submitted amount replaces the earlier manual adjustment.
+        # Positive is an addition; negative is a deduction.
         new_net_salary = money(
             gross_salary - lop_deduction + requested_adjustment
         )
-        if new_net_salary < Decimal("0.00"):
+        if new_net_salary < ZERO_MONEY:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Adjustment cannot make net salary negative",
@@ -527,8 +621,9 @@ def adjust_payroll(
     except HTTPException:
         db.rollback()
         raise
-    except SQLAlchemyError as exc:
+    except (SQLAlchemyError, InvalidOperation) as exc:
         db.rollback()
+        logger.exception("Unable to adjust payroll_id=%s", payroll_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to adjust payroll",
@@ -544,18 +639,77 @@ def lock_payroll(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("Admin", "HR")),
 ):
-    payroll = get_payroll_or_404(payroll_id, db)
-    if payroll.is_locked:
+    payroll = (
+        db.query(Payroll)
+        .filter(Payroll.id == payroll_id)
+        .with_for_update()
+        .first()
+    )
+    if payroll is None:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Payroll is already locked",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payroll not found",
         )
 
-    payroll.is_locked = True
-    payroll.status = "Locked"
-    payroll.locked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    if payroll.is_locked or payroll.status in ("Locked", "Paid"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Payroll is already locked or paid",
+        )
+    if payroll.status != "Generated":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only generated payroll can be locked",
+        )
 
+    employee = get_employee_for_payroll_or_404(payroll.employee_id, db)
+    _, month_end = validate_payroll_period_for_employee(
+        employee=employee,
+        year=payroll.year,
+        month=payroll.month,
+    )
+    if month_end >= date.today():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Payroll can be locked only after the payroll month has ended",
+        )
+
+    # Recalculate using the complete month before locking. This handles a
+    # payroll draft that was generated before the month ended. Preserve the
+    # existing manual adjustment but reapply it to the recomputed base net pay.
     try:
+        monthly_salary = money(Decimal(str(payroll.monthly_salary)))
+        values = calculate_payroll_values(
+            db=db,
+            employee=employee,
+            year=payroll.year,
+            month=payroll.month,
+            monthly_salary=monthly_salary,
+            as_of_date=date.today(),
+        )
+        manual_adjustment = money(
+            Decimal(str(payroll.manual_adjustment_amount or ZERO_MONEY))
+        )
+        recomputed_net = money(
+            Decimal(str(values["gross_salary"]))
+            - Decimal(str(values["lop_deduction"]))
+            + manual_adjustment
+        )
+        if recomputed_net < ZERO_MONEY:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payroll cannot be locked because the adjusted net salary would be negative",
+            )
+
+        payroll.present_days = int(values["present_days"])
+        payroll.lop_days = int(values["lop_days"])
+        payroll.gross_salary = values["gross_salary"]
+        payroll.lop_deduction = values["lop_deduction"]
+        payroll.net_salary = recomputed_net
+        payroll.is_locked = True
+        payroll.status = "Locked"
+        payroll.locked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
         record_audit_log(
             db=db,
             actor=current_user,
@@ -566,14 +720,23 @@ def lock_payroll(
                 "employee_id": payroll.employee_id,
                 "month": payroll.month,
                 "year": payroll.year,
+                "present_days": payroll.present_days,
+                "lop_days": payroll.lop_days,
+                "gross_salary": str(payroll.gross_salary),
+                "lop_deduction": str(payroll.lop_deduction),
+                "manual_adjustment_amount": str(manual_adjustment),
                 "net_salary": str(payroll.net_salary),
                 "status": "Locked",
             },
         )
         db.commit()
         db.refresh(payroll)
-    except SQLAlchemyError as exc:
+    except HTTPException:
         db.rollback()
+        raise
+    except (SQLAlchemyError, InvalidOperation) as exc:
+        db.rollback()
+        logger.exception("Unable to lock payroll_id=%s", payroll_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to lock payroll",
@@ -589,20 +752,42 @@ def simulate_salary_credit(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("Admin", "HR")),
 ):
-    payroll = get_payroll_or_404(payroll_id, db)
-
-    if not payroll.is_locked:
+    payroll = (
+        db.query(Payroll)
+        .filter(Payroll.id == payroll_id)
+        .with_for_update()
+        .first()
+    )
+    if payroll is None:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Lock payroll before simulating salary credit",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payroll not found",
         )
+
     if payroll.status == "Paid":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Salary credit has already been simulated",
         )
+    if not payroll.is_locked or payroll.status != "Locked":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Lock payroll before simulating salary credit",
+        )
 
-    # Simulation only: this does not transfer money to a bank account.
+    employee = get_employee_for_payroll_or_404(payroll.employee_id, db)
+    _, month_end = validate_payroll_period_for_employee(
+        employee=employee,
+        year=payroll.year,
+        month=payroll.month,
+    )
+    if month_end >= date.today():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Salary credit can be simulated only after the payroll month has ended",
+        )
+
+    # Simulation only: no money is transferred to a bank account.
     payroll.status = "Paid"
     payroll.paid_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
