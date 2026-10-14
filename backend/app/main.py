@@ -25,6 +25,9 @@ from app.models.audit_log import AuditLog
 from app.routers.audit_logs import router as audit_logs_router
 from app.models.email_log import EmailLog
 from app.routers.reports import router as reports_router
+from app.routers.role_management import (
+    router as role_management_router,
+)
 
 app = FastAPI(
     title="HRMS API",
@@ -60,7 +63,7 @@ app.include_router(payroll_router)
 app.include_router(salary_slips_router)
 app.include_router(audit_logs_router)
 app.include_router(reports_router)
-
+app.include_router(role_management_router)
 
 @app.get("/")
 def home():

@@ -1,22 +1,54 @@
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
-from datetime import datetime, date, time, timedelta, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.permissions import require_roles
 from app.db.database import get_db
 from app.models.attendance import Attendance
 from app.models.employee import Employee
+from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.attendance import (
     AttendanceResponse,
     AttendanceMonthlySummary,
 )
+from app.utils.audit import record_audit_log
 
-router = APIRouter(prefix="/attendance", tags=["Attendance"])
+
+router = APIRouter(
+    prefix="/attendance",
+    tags=["Attendance"],
+)
+
+# HRMS company-local calendar date.
+COMPANY_TZ = ZoneInfo("Asia/Kolkata")
 
 
-def get_employee(db: Session, user_id: int) -> Employee:
+# ---------------------------------------------------------
+# ADMIN ATTENDANCE CORRECTION REQUEST
+# ---------------------------------------------------------
+
+class AttendanceOverrideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attendance_date: date | None = None
+    check_in: datetime | None = None
+    check_out: datetime | None = None
+    reason: str = Field(min_length=3, max_length=500)
+
+
+# ---------------------------------------------------------
+# COMMON HELPERS
+# ---------------------------------------------------------
+
+def get_employee(
+    db: Session,
+    user_id: int,
+) -> Employee:
     employee = (
         db.query(Employee)
         .filter(
@@ -26,51 +58,129 @@ def get_employee(db: Session, user_id: int) -> Employee:
         .first()
     )
 
-    if not employee:
+    if employee is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Active employee record not found",
         )
 
     return employee
 
 
+def normalize_input_datetime(value: datetime) -> datetime:
+    """
+    Accept timezone-aware API timestamps.
+
+    If the client submits a timestamp without a timezone,
+    interpret it as Chennai local time, then convert to UTC.
+    Store timestamps consistently in UTC.
+    """
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=COMPANY_TZ)
+
+    return value.astimezone(timezone.utc)
+
+
+def as_utc_datetime(value: datetime) -> datetime:
+    """
+    Normalize a timestamp read from the database.
+
+    MySQL may return a naive datetime even when the SQLAlchemy
+    model uses DateTime(timezone=True). Existing naive database
+    values are treated as UTC.
+    """
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def current_utc_time() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def current_company_date() -> date:
+    return datetime.now(COMPANY_TZ).date()
+
+
+def calculate_working_hours(
+    check_in_value: datetime,
+    check_out_value: datetime | None,
+) -> float | None:
+    if check_out_value is None:
+        return None
+
+    start = as_utc_datetime(check_in_value)
+    end = as_utc_datetime(check_out_value)
+
+    return round(
+        max(0.0, (end - start).total_seconds() / 3600),
+        2,
+    )
+
+
 def to_response(record: Attendance) -> dict:
-    hours = None
-
-    if record.check_out:
-        start = record.check_in
-        end = record.check_out
-
-        # MySQL drivers may return naive datetimes for timezone columns.
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
-
-        hours = round((end - start).total_seconds() / 3600, 2)
-
     return {
         "id": record.id,
         "employee_id": record.employee_id,
         "attendance_date": record.attendance_date,
-        "check_in": record.check_in,
-        "check_out": record.check_out,
-        "working_hours": hours,
+        "check_in": as_utc_datetime(record.check_in),
+        "check_out": (
+            as_utc_datetime(record.check_out)
+            if record.check_out is not None
+            else None
+        ),
+        "working_hours": calculate_working_hours(
+            record.check_in,
+            record.check_out,
+        ),
     }
 
 
-@router.post("/check-in", response_model=AttendanceResponse)
+def get_attendance_or_404(
+    db: Session,
+    attendance_id: int,
+    lock: bool = False,
+) -> Attendance:
+    query = db.query(Attendance).filter(
+        Attendance.id == attendance_id
+    )
+
+    if lock:
+        query = query.with_for_update()
+
+    record = query.first()
+
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attendance record not found",
+        )
+
+    return record
+
+
+# ---------------------------------------------------------
+# EMPLOYEE CHECK-IN
+# ---------------------------------------------------------
+
+@router.post(
+    "/check-in",
+    response_model=AttendanceResponse,
+)
 def check_in(
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     employee = get_employee(db, current_user.id)
 
-    now = datetime.now(timezone.utc)
-    today = now.date()
+    now = current_utc_time()
+    today = now.astimezone(COMPANY_TZ).date()
 
-    existing = (
+    # Prevent a second attendance record for the same local day.
+    existing_today = (
         db.query(Attendance)
         .filter(
             Attendance.employee_id == employee.id,
@@ -79,112 +189,236 @@ def check_in(
         .first()
     )
 
-    if existing:
+    if existing_today is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Attendance already exists for today",
+        )
+
+    # Also prevent another check-in when an earlier attendance
+    # record has not been checked out (e.g. an overnight shift).
+    open_record = (
+        db.query(Attendance)
+        .filter(
+            Attendance.employee_id == employee.id,
+            Attendance.check_out.is_(None),
+        )
+        .order_by(
+            Attendance.attendance_date.desc(),
+            Attendance.id.desc(),
+        )
+        .first()
+    )
+
+    if open_record is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "You have an unfinished attendance record. "
+                "Check out before starting another attendance."
+            ),
         )
 
     record = Attendance(
         employee_id=employee.id,
         attendance_date=today,
         check_in=now,
+        check_out=None,
     )
 
     try:
         db.add(record)
+
+        # Obtain the generated ID for the audit entry.
+        db.flush()
+
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="attendance.checked_in",
+            entity_type="attendance",
+            entity_id=record.id,
+            details={
+                "employee_id": employee.id,
+                "employee_code": employee.employee_code,
+                "attendance_date": today.isoformat(),
+                "check_in": now.isoformat(),
+            },
+        )
+
+        # Attendance and audit log commit together.
         db.commit()
         db.refresh(record)
-    except Exception:
+
+    except IntegrityError as exc:
         db.rollback()
+
+        # Handles concurrent requests protected by the
+        # unique employee_id + attendance_date constraint.
         raise HTTPException(
-            status_code=409,
-            detail="Attendance could not be created; check for an existing record",
-        )
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Attendance already exists for this date",
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to record check-in",
+        ) from exc
 
     return to_response(record)
 
 
-@router.post("/check-out", response_model=AttendanceResponse)
+# ---------------------------------------------------------
+# EMPLOYEE CHECK-OUT
+# ---------------------------------------------------------
+
+@router.post(
+    "/check-out",
+    response_model=AttendanceResponse,
+)
 def check_out(
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     employee = get_employee(db, current_user.id)
+    today = current_company_date()
 
-    today = datetime.now(timezone.utc).date()
-
+    # Select the latest unfinished record. This permits an
+    # overnight shift to check out after midnight.
     record = (
         db.query(Attendance)
         .filter(
             Attendance.employee_id == employee.id,
-            Attendance.attendance_date == today,
+            Attendance.check_out.is_(None),
         )
+        .order_by(
+            Attendance.attendance_date.desc(),
+            Attendance.id.desc(),
+        )
+        .with_for_update()
         .first()
     )
 
-    if not record:
+    if record is None:
+        completed_today = (
+            db.query(Attendance)
+            .filter(
+                Attendance.employee_id == employee.id,
+                Attendance.attendance_date == today,
+            )
+            .first()
+        )
+
+        if (
+            completed_today is not None
+            and completed_today.check_out is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You have already checked out today",
+            )
+
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Check in before checking out",
         )
 
-    if record.check_out:
-        raise HTTPException(
-            status_code=409,
-            detail="You have already checked out today",
-        )
-
-    now = datetime.now(timezone.utc)
-
-    if record.check_in.tzinfo is None:
-        check_in_time = record.check_in.replace(tzinfo=timezone.utc)
-    else:
-        check_in_time = record.check_in
+    now = current_utc_time()
+    check_in_time = as_utc_datetime(record.check_in)
 
     if now < check_in_time:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Check-out cannot be earlier than check-in",
         )
 
     record.check_out = now
-    db.commit()
-    db.refresh(record)
+
+    try:
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="attendance.checked_out",
+            entity_type="attendance",
+            entity_id=record.id,
+            details={
+                "employee_id": employee.id,
+                "attendance_date": (
+                    record.attendance_date.isoformat()
+                ),
+                "check_in": check_in_time.isoformat(),
+                "check_out": now.isoformat(),
+                "working_hours": calculate_working_hours(
+                    check_in_time,
+                    now,
+                ),
+            },
+        )
+
+        db.commit()
+        db.refresh(record)
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to record check-out",
+        ) from exc
 
     return to_response(record)
 
 
-@router.get("/me", response_model=list[AttendanceResponse])
+# ---------------------------------------------------------
+# EMPLOYEE: VIEW OWN ATTENDANCE HISTORY
+# ---------------------------------------------------------
+
+@router.get(
+    "/me",
+    response_model=list[AttendanceResponse],
+)
 def my_attendance(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     employee = get_employee(db, current_user.id)
 
     records = (
         db.query(Attendance)
-        .filter(Attendance.employee_id == employee.id)
-        .order_by(Attendance.attendance_date.desc())
+        .filter(
+            Attendance.employee_id == employee.id
+        )
+        .order_by(
+            Attendance.attendance_date.desc(),
+            Attendance.id.desc(),
+        )
+        .offset(skip)
+        .limit(limit)
         .all()
     )
 
     return [to_response(record) for record in records]
 
 
-@router.get("/summary", response_model=AttendanceMonthlySummary)
-def monthly_summary(
-    month: int,
-    year: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    if not 1 <= month <= 12 or not 2000 <= year <= 2100:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide a valid month and year",
-        )
+# ---------------------------------------------------------
+# EMPLOYEE: MONTHLY ATTENDANCE SUMMARY
+# ---------------------------------------------------------
 
+@router.get(
+    "/summary",
+    response_model=AttendanceMonthlySummary,
+)
+def monthly_summary(
+    month: int = Query(..., ge=1, le=12),
+    year: int = Query(..., ge=2000, le=2100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     employee = get_employee(db, current_user.id)
 
     start_date = date(year, month, 1)
@@ -201,22 +435,22 @@ def monthly_summary(
             Attendance.attendance_date >= start_date,
             Attendance.attendance_date < end_date,
         )
+        .order_by(Attendance.attendance_date)
         .all()
     )
 
     total_hours = 0.0
 
     for record in records:
-        if record.check_out:
-            start = record.check_in
-            end = record.check_out
+        hours = calculate_working_hours(
+            record.check_in,
+            record.check_out,
+        )
 
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
-            if end.tzinfo is None:
-                end = end.replace(tzinfo=timezone.utc)
-
-            total_hours += (end - start).total_seconds() / 3600
+        # An open attendance record has no completed working-hours
+        # value, so it is excluded from the hours total.
+        if hours is not None:
+            total_hours += hours
 
     return {
         "month": month,
@@ -224,3 +458,228 @@ def monthly_summary(
         "total_days_present": len(records),
         "total_working_hours": round(total_hours, 2),
     }
+
+
+# ---------------------------------------------------------
+# ADMIN/HR: LIST ATTENDANCE RECORDS
+# ---------------------------------------------------------
+
+@router.get(
+    "/",
+    response_model=list[AttendanceResponse],
+)
+def list_attendance(
+    employee_id: int | None = Query(default=None, ge=1),
+    start_date: date | None = None,
+    end_date: date | None = None,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("Admin", "HR")
+    ),
+):
+    if (
+        start_date is not None
+        and end_date is not None
+        and end_date < start_date
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="End date cannot be before start date",
+        )
+
+    query = db.query(Attendance)
+
+    if employee_id is not None:
+        query = query.filter(
+            Attendance.employee_id == employee_id
+        )
+
+    if start_date is not None:
+        query = query.filter(
+            Attendance.attendance_date >= start_date
+        )
+
+    if end_date is not None:
+        query = query.filter(
+            Attendance.attendance_date <= end_date
+        )
+
+    records = (
+        query
+        .order_by(
+            Attendance.attendance_date.desc(),
+            Attendance.id.desc(),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+    return [to_response(record) for record in records]
+
+
+# ---------------------------------------------------------
+# ADMIN ONLY: CORRECT ATTENDANCE
+# ---------------------------------------------------------
+
+@router.patch(
+    "/{attendance_id}/override",
+    response_model=AttendanceResponse,
+)
+def override_attendance(
+    attendance_id: int,
+    data: AttendanceOverrideRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("Admin")
+    ),
+):
+    record = get_attendance_or_404(
+        db=db,
+        attendance_id=attendance_id,
+        lock=True,
+    )
+
+    fields_set = data.model_fields_set
+    changed_fields = sorted(fields_set - {"reason"})
+
+    if not changed_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Provide attendance_date, check_in, "
+                "or check_out to correct"
+            ),
+        )
+
+    if "attendance_date" in fields_set:
+        if data.attendance_date is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Attendance date cannot be null",
+            )
+
+    if "check_in" in fields_set and data.check_in is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Check-in time cannot be null",
+        )
+
+    reason = data.reason.strip()
+
+    if len(reason) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide a meaningful correction reason",
+        )
+
+    # Capture the original state for audit history.
+    before = {
+        "attendance_date": record.attendance_date.isoformat(),
+        "check_in": as_utc_datetime(
+            record.check_in
+        ).isoformat(),
+        "check_out": (
+            as_utc_datetime(record.check_out).isoformat()
+            if record.check_out is not None
+            else None
+        ),
+    }
+
+    new_check_in = as_utc_datetime(record.check_in)
+    new_check_out = (
+        as_utc_datetime(record.check_out)
+        if record.check_out is not None
+        else None
+    )
+    new_attendance_date = record.attendance_date
+
+    if "check_in" in fields_set:
+        new_check_in = normalize_input_datetime(
+            data.check_in
+        )
+
+        # If the check-in timestamp changes and a date was not
+        # separately supplied, derive the new company-local date.
+        if "attendance_date" not in fields_set:
+            new_attendance_date = (
+                new_check_in.astimezone(COMPANY_TZ).date()
+            )
+
+    if "attendance_date" in fields_set:
+        new_attendance_date = data.attendance_date
+
+    if "check_out" in fields_set:
+        new_check_out = (
+            normalize_input_datetime(data.check_out)
+            if data.check_out is not None
+            else None
+        )
+
+    if (
+        new_check_out is not None
+        and new_check_out < new_check_in
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Check-out cannot be earlier than check-in",
+        )
+
+    try:
+        record.attendance_date = new_attendance_date
+        record.check_in = new_check_in
+        record.check_out = new_check_out
+
+        after = {
+            "attendance_date": (
+                record.attendance_date.isoformat()
+            ),
+            "check_in": new_check_in.isoformat(),
+            "check_out": (
+                new_check_out.isoformat()
+                if new_check_out is not None
+                else None
+            ),
+        }
+
+        record_audit_log(
+            db=db,
+            actor=current_user,
+            action="attendance.admin_overridden",
+            entity_type="attendance",
+            entity_id=record.id,
+            details={
+                "employee_id": record.employee_id,
+                "changed_fields": changed_fields,
+                "reason": reason,
+                "before": before,
+                "after": after,
+            },
+        )
+
+        # Correction and audit entry commit together.
+        db.commit()
+        db.refresh(record)
+
+    except IntegrityError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The correction conflicts with an existing "
+                "attendance record for this employee and date"
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to correct attendance record",
+        ) from exc
+
+    return to_response(record)

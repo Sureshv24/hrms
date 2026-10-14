@@ -12,15 +12,25 @@ class PayrollResponse(BaseModel):
     employee_id: int
     month: int
     year: int
+
     monthly_salary: Decimal
     present_days: int
     lop_days: int
+
     gross_salary: Decimal
     lop_deduction: Decimal
     net_salary: Decimal
+
+    # Manual payroll adjustment details.
+    manual_adjustment_amount: Decimal
+    adjustment_reason: str | None = None
+    adjusted_by: int | None = None
+    adjusted_at: datetime | None = None
+
     status: str
     is_locked: bool
     generated_by: int
-    locked_at: datetime | None
-    paid_at: datetime | None
+
+    locked_at: datetime | None = None
+    paid_at: datetime | None = None
     created_at: datetime

@@ -41,12 +41,52 @@ class Payroll(Base):
     # Snapshot of the employee's monthly salary at generation time.
     monthly_salary = Column(Numeric(12, 2), nullable=False)
 
-    present_days = Column(Integer, nullable=False, default=0)
-    lop_days = Column(Integer, nullable=False, default=0)
+    present_days = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    lop_days = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
 
     gross_salary = Column(Numeric(12, 2), nullable=False)
-    lop_deduction = Column(Numeric(12, 2), nullable=False, default=0)
+
+    lop_deduction = Column(
+        Numeric(12, 2),
+        nullable=False,
+        default=0,
+    )
+
     net_salary = Column(Numeric(12, 2), nullable=False)
+
+    # Manual adjustment: positive for an addition,
+    # negative for a deduction.
+    manual_adjustment_amount = Column(
+        Numeric(12, 2),
+        nullable=False,
+        default=0,
+        server_default="0.00",
+    )
+
+    adjustment_reason = Column(
+        String(500),
+        nullable=True,
+    )
+
+    adjusted_by = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    adjusted_at = Column(
+        DateTime,
+        nullable=True,
+    )
 
     status = Column(
         String(20),
@@ -55,7 +95,11 @@ class Payroll(Base):
         server_default="Generated",
     )
 
-    is_locked = Column(Boolean, nullable=False, default=False)
+    is_locked = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
 
     generated_by = Column(
         Integer,
