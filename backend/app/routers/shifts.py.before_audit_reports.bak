@@ -1,0 +1,299 @@
+﻿from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.permissions import require_roles
+from app.db.database import get_db
+from app.models.employee import Employee
+from app.models.shift import Shift, EmployeeShiftAssignment
+from app.schemas.shift import (
+    ShiftCreate,
+    ShiftUpdate,
+    ShiftResponse,
+    ShiftAssignmentCreate,
+    ShiftAssignmentResponse,
+)
+
+router = APIRouter(prefix="/shifts", tags=["Shift Management"])
+
+admin_hr = Depends(require_roles("Admin", "HR"))
+
+
+# --------------------------------------------------
+# SHIFT ASSIGNMENTS
+# --------------------------------------------------
+
+@router.get("/assignments", response_model=list[ShiftAssignmentResponse])
+def list_shift_assignments(
+    employee_id: int | None = Query(default=None, gt=0),
+    shift_id: int | None = Query(default=None, gt=0),
+    department: str | None = Query(default=None, min_length=1, max_length=100),
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    query = db.query(EmployeeShiftAssignment)
+
+    if employee_id is not None:
+        query = query.filter(
+            EmployeeShiftAssignment.employee_id == employee_id
+        )
+
+    if shift_id is not None:
+        query = query.filter(
+            EmployeeShiftAssignment.shift_id == shift_id
+        )
+
+    if department is not None:
+        query = query.filter(
+            func.lower(func.trim(EmployeeShiftAssignment.department))
+            == department.strip().lower()
+        )
+
+    return query.order_by(
+        EmployeeShiftAssignment.effective_from.desc(),
+        EmployeeShiftAssignment.id.desc(),
+    ).all()
+
+
+@router.post(
+    "/assignments",
+    response_model=ShiftAssignmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_shift_assignment(
+    payload: ShiftAssignmentCreate,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    shift = db.query(Shift).filter(
+        Shift.id == payload.shift_id
+    ).first()
+
+    if not shift or not shift.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Active shift not found",
+        )
+
+    if payload.employee_id is not None:
+        employee = db.query(Employee).filter(
+            Employee.id == payload.employee_id
+        ).first()
+
+        if not employee:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Employee not found",
+            )
+
+        query = db.query(EmployeeShiftAssignment).filter(
+            EmployeeShiftAssignment.employee_id == payload.employee_id
+        )
+    else:
+        department_name = payload.department.strip()
+
+        matching_employee = db.query(Employee.id).filter(
+            func.lower(func.trim(Employee.department))
+            == department_name.lower()
+        ).first()
+
+        if not matching_employee:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No employees found in this department",
+            )
+
+        query = db.query(EmployeeShiftAssignment).filter(
+            EmployeeShiftAssignment.employee_id.is_(None),
+            func.lower(func.trim(EmployeeShiftAssignment.department))
+            == department_name.lower(),
+        )
+
+    query = query.filter(
+        or_(
+            EmployeeShiftAssignment.effective_to.is_(None),
+            EmployeeShiftAssignment.effective_to >= payload.effective_from,
+        )
+    )
+
+    if payload.effective_to is not None:
+        query = query.filter(
+            EmployeeShiftAssignment.effective_from <= payload.effective_to
+        )
+
+    if query.first():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An assignment already overlaps these effective dates",
+        )
+
+    assignment = EmployeeShiftAssignment(
+        shift_id=payload.shift_id,
+        employee_id=payload.employee_id,
+        department=payload.department,
+        effective_from=payload.effective_from,
+        effective_to=payload.effective_to,
+        assigned_by=current_user.id,
+    )
+
+    try:
+        db.add(assignment)
+        db.commit()
+        db.refresh(assignment)
+        return assignment
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Assignment could not be saved. Check the referenced IDs.",
+        )
+
+
+# --------------------------------------------------
+# SHIFT CRUD
+# --------------------------------------------------
+
+@router.post(
+    "/",
+    response_model=ShiftResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_shift(
+    payload: ShiftCreate,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    shift = Shift(
+        **payload.model_dump(),
+        created_by=current_user.id,
+    )
+
+    try:
+        db.add(shift)
+        db.commit()
+        db.refresh(shift)
+        return shift
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A shift with this name may already exist",
+        )
+
+
+@router.get("/", response_model=list[ShiftResponse])
+def list_shifts(
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    query = db.query(Shift)
+
+    if not include_inactive:
+        query = query.filter(Shift.is_active.is_(True))
+
+    return query.order_by(Shift.name.asc()).all()
+
+
+@router.get("/{shift_id}", response_model=ShiftResponse)
+def get_shift(
+    shift_id: int,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    shift = db.query(Shift).filter(
+        Shift.id == shift_id
+    ).first()
+
+    if not shift:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shift not found",
+        )
+
+    return shift
+
+
+@router.patch("/{shift_id}", response_model=ShiftResponse)
+def update_shift(
+    shift_id: int,
+    payload: ShiftUpdate,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    shift = db.query(Shift).filter(
+        Shift.id == shift_id
+    ).first()
+
+    if not shift:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shift not found",
+        )
+
+    changes = payload.model_dump(exclude_unset=True)
+
+    new_type = changes.get("shift_type", shift.shift_type)
+    new_start = changes.get("start_time", shift.start_time)
+    new_end = changes.get("end_time", shift.end_time)
+
+    if new_type != "Flexible" and (
+        new_start is None or new_end is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Fixed shifts require start_time and end_time",
+        )
+
+    if (
+        new_start is not None
+        and new_end is not None
+        and new_start == new_end
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Shift start and end times cannot be identical",
+        )
+
+    for field, value in changes.items():
+        setattr(shift, field, value)
+
+    try:
+        db.commit()
+        db.refresh(shift)
+        return shift
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Shift update failed. Check for a duplicate shift name.",
+        )
+
+
+@router.delete("/{shift_id}")
+def deactivate_shift(
+    shift_id: int,
+    db: Session = Depends(get_db),
+    current_user=admin_hr,
+):
+    shift = db.query(Shift).filter(
+        Shift.id == shift_id
+    ).first()
+
+    if not shift:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shift not found",
+        )
+
+    if not shift.is_active:
+        return {"message": "Shift is already inactive"}
+
+    shift.is_active = False
+    db.commit()
+
+    return {
+        "message": "Shift deactivated successfully",
+        "shift_id": shift.id,
+    }

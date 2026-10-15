@@ -1,7 +1,8 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, or_
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from app.core.permissions import require_roles
 from app.db.database import get_db
 from app.models.attendance import Attendance
 from app.models.employee import Employee
+from app.models.shift import Shift, EmployeeShiftAssignment
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.attendance import (
@@ -121,8 +123,176 @@ def calculate_working_hours(
     )
 
 
-def to_response(record: Attendance) -> dict:
-    return {
+def get_assigned_shift(
+    db: Session,
+    employee_id: int,
+    attendance_date: date,
+) -> Shift | None:
+    employee = (
+        db.query(Employee)
+        .filter(Employee.id == employee_id)
+        .first()
+    )
+
+    if employee is None:
+        return None
+
+    date_filters = [
+        EmployeeShiftAssignment.effective_from <= attendance_date,
+        or_(
+            EmployeeShiftAssignment.effective_to.is_(None),
+            EmployeeShiftAssignment.effective_to >= attendance_date,
+        ),
+    ]
+
+    # Prefer an employee-specific assignment.
+    shift = (
+        db.query(Shift)
+        .join(
+            EmployeeShiftAssignment,
+            EmployeeShiftAssignment.shift_id == Shift.id,
+        )
+        .filter(
+            EmployeeShiftAssignment.employee_id == employee_id,
+            *date_filters,
+        )
+        .order_by(
+            EmployeeShiftAssignment.effective_from.desc(),
+            EmployeeShiftAssignment.id.desc(),
+        )
+        .first()
+    )
+
+    if shift is not None:
+        return shift
+
+    # Fall back to a department assignment.
+    department = (employee.department or "").strip().lower()
+    if not department:
+        return None
+
+    return (
+        db.query(Shift)
+        .join(
+            EmployeeShiftAssignment,
+            EmployeeShiftAssignment.shift_id == Shift.id,
+        )
+        .filter(
+            EmployeeShiftAssignment.employee_id.is_(None),
+            func.lower(func.trim(EmployeeShiftAssignment.department))
+            == department,
+            *date_filters,
+        )
+        .order_by(
+            EmployeeShiftAssignment.effective_from.desc(),
+            EmployeeShiftAssignment.id.desc(),
+        )
+        .first()
+    )
+
+
+def calculate_shift_metrics(
+    record: Attendance,
+    shift: Shift | None,
+) -> dict:
+    metrics = {
+        "assigned_shift_id": None,
+        "assigned_shift_name": None,
+        "shift_type": None,
+        "is_late": None,
+        "late_minutes": None,
+        "is_early_checkout": None,
+        "early_checkout_minutes": None,
+        "overtime_minutes": None,
+    }
+
+    if shift is None:
+        return metrics
+
+    metrics.update({
+        "assigned_shift_id": shift.id,
+        "assigned_shift_name": shift.name,
+        "shift_type": shift.shift_type,
+    })
+
+    # Flexible shifts use expected duration instead of fixed times.
+    if shift.shift_type == "Flexible":
+        if record.check_out is not None:
+            start = as_utc_datetime(record.check_in)
+            end = as_utc_datetime(record.check_out)
+            worked_minutes = max(
+                0, int((end - start).total_seconds() // 60)
+            )
+            metrics["overtime_minutes"] = max(
+                0, worked_minutes - shift.expected_work_minutes
+            )
+        return metrics
+
+    check_in_local = as_utc_datetime(
+        record.check_in
+    ).astimezone(COMPANY_TZ)
+
+    if shift.start_time is not None:
+        scheduled_start = datetime.combine(
+            record.attendance_date,
+            shift.start_time,
+        ).replace(tzinfo=COMPANY_TZ)
+
+        grace_deadline = scheduled_start + timedelta(
+            minutes=shift.grace_period_minutes
+        )
+        late_seconds = (
+            check_in_local - grace_deadline
+        ).total_seconds()
+
+        metrics["is_late"] = late_seconds > 0
+        metrics["late_minutes"] = (
+            int((late_seconds + 59) // 60)
+            if late_seconds > 0 else 0
+        )
+
+    if record.check_out is None or shift.end_time is None:
+        return metrics
+
+    check_out_local = as_utc_datetime(
+        record.check_out
+    ).astimezone(COMPANY_TZ)
+
+    end_date = record.attendance_date
+    if (
+        shift.start_time is not None
+        and shift.end_time <= shift.start_time
+    ):
+        end_date += timedelta(days=1)
+
+    scheduled_end = datetime.combine(
+        end_date,
+        shift.end_time,
+    ).replace(tzinfo=COMPANY_TZ)
+
+    early_seconds = (
+        scheduled_end - check_out_local
+    ).total_seconds()
+
+    metrics["is_early_checkout"] = early_seconds > 0
+    metrics["early_checkout_minutes"] = (
+        int((early_seconds + 59) // 60)
+        if early_seconds > 0 else 0
+    )
+
+    overtime_seconds = (
+        check_out_local - scheduled_end
+    ).total_seconds()
+
+    metrics["overtime_minutes"] = max(
+        0, int(overtime_seconds // 60)
+    )
+
+    return metrics
+
+
+def to_response(record: Attendance, db: Session) -> dict:
+    response = {
         "id": record.id,
         "employee_id": record.employee_id,
         "attendance_date": record.attendance_date,
@@ -137,6 +307,14 @@ def to_response(record: Attendance) -> dict:
             record.check_out,
         ),
     }
+
+    shift = get_assigned_shift(
+        db,
+        record.employee_id,
+        record.attendance_date,
+    )
+    response.update(calculate_shift_metrics(record, shift))
+    return response
 
 
 def get_attendance_or_404(
@@ -268,7 +446,7 @@ def check_in(
             detail="Unable to record check-in",
         ) from exc
 
-    return to_response(record)
+    return to_response(record, db)
 
 
 # ---------------------------------------------------------
@@ -369,7 +547,7 @@ def check_out(
             detail="Unable to record check-out",
         ) from exc
 
-    return to_response(record)
+    return to_response(record, db)
 
 
 # ---------------------------------------------------------
@@ -402,7 +580,7 @@ def my_attendance(
         .all()
     )
 
-    return [to_response(record) for record in records]
+    return [to_response(record, db) for record in records]
 
 
 # ---------------------------------------------------------
@@ -517,7 +695,7 @@ def list_attendance(
         .all()
     )
 
-    return [to_response(record) for record in records]
+    return [to_response(record, db) for record in records]
 
 
 # ---------------------------------------------------------
@@ -682,4 +860,4 @@ def override_attendance(
             detail="Unable to correct attendance record",
         ) from exc
 
-    return to_response(record)
+    return to_response(record, db)

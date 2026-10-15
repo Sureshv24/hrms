@@ -1,4 +1,4 @@
-
+﻿
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -13,9 +13,12 @@ from app.models.attendance import Attendance
 from app.models.leave import LeaveRequest
 from app.models.leave_balance import LeaveBalance
 from app.models.payroll import Payroll
+from app.models.holiday import Holiday, EmployeeHolidaySelection
+from app.models.shift import Shift, EmployeeShiftAssignment
 
 # API routers
 from app.routers.auth import router as auth_router
+from app.routers.shifts import router as shifts_router
 from app.routers.employees import router as employee_router
 from app.routers.attendance import router as attendance_router
 from app.routers.leaves import router as leave_router
@@ -25,6 +28,7 @@ from app.models.audit_log import AuditLog
 from app.routers.audit_logs import router as audit_logs_router
 from app.models.email_log import EmailLog
 from app.routers.reports import router as reports_router
+from app.routers.holidays import router as holidays_router
 from app.routers.role_management import (
     router as role_management_router,
 )
@@ -64,6 +68,8 @@ app.include_router(salary_slips_router)
 app.include_router(audit_logs_router)
 app.include_router(reports_router)
 app.include_router(role_management_router)
+app.include_router(holidays_router)
+app.include_router(shifts_router)
 
 @app.get("/")
 def home():
@@ -88,3 +94,7 @@ def health():
             "status": "unhealthy",
             "database": "disconnected",
         }
+
+
+
+

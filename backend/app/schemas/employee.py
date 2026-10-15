@@ -1,4 +1,4 @@
-
+﻿
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -10,6 +10,7 @@ class EmployeeCreate(BaseModel):
     employee_code: str = Field(min_length=2, max_length=20)
     department: str = Field(min_length=2, max_length=100)
     designation: str = Field(min_length=2, max_length=100)
+    region: str | None = Field(default=None, max_length=100)
     joining_date: date
     salary: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     phone: str | None = Field(default=None, max_length=20)
@@ -19,6 +20,7 @@ class EmployeeCreate(BaseModel):
 class EmployeeUpdate(BaseModel):
     department: str | None = Field(default=None, max_length=100)
     designation: str | None = Field(default=None, max_length=100)
+    region: str | None = Field(default=None, max_length=100)
     joining_date: date | None = None
     salary: Decimal | None = Field(
         default=None, gt=0, max_digits=12, decimal_places=2
@@ -34,6 +36,7 @@ class EmployeeResponse(BaseModel):
     user_id: int
     employee_code: str
     department: str
+    region: str | None
     designation: str
     joining_date: date
     salary: Decimal
@@ -41,3 +44,4 @@ class EmployeeResponse(BaseModel):
     address: str | None
     is_active: bool
     created_at: datetime
+

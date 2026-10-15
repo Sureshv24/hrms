@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.permissions import require_roles
@@ -13,6 +14,7 @@ from app.db.database import get_db
 from app.models.attendance import Attendance
 from app.models.employee import Employee
 from app.models.leave import LeaveRequest
+from app.models.holiday import Holiday, EmployeeHolidaySelection
 from app.models.payroll import Payroll
 from app.models.user import User
 from app.routers.auth import get_current_user
@@ -149,16 +151,75 @@ def iter_dates(start_date: date, end_date: date):
         current_date += timedelta(days=1)
 
 
-def get_working_dates(start_date: date, end_date: date) -> set[date]:
-    """Return Monday-Friday dates; a company holiday calendar is not configured."""
+
+def get_working_dates(
+    db: Session,
+    employee_id: int,
+    start_date: date,
+    end_date: date,
+) -> set[date]:
+    """Return weekdays after excluding applicable active holidays."""
     if start_date > end_date:
         return set()
-    return {
+
+    weekdays = {
         current_date
         for current_date in iter_dates(start_date, end_date)
         if current_date.weekday() < 5
     }
 
+    if not weekdays:
+        return set()
+
+    employee = (
+        db.query(Employee)
+        .filter(Employee.id == employee_id)
+        .first()
+    )
+
+    # Company holidays apply to all employees.
+    applicable_filters = [
+        Holiday.holiday_type == "Company",
+    ]
+
+    # Regional holidays apply only to employees whose region matches.
+    if employee and employee.region and employee.region.strip():
+        applicable_filters.append(
+            and_(
+                Holiday.holiday_type == "Regional",
+                func.lower(func.trim(Holiday.region))
+                == employee.region.strip().lower(),
+            )
+        )
+
+    # Optional holidays apply only when this employee selected them.
+    selected_holiday_ids = (
+        db.query(EmployeeHolidaySelection.holiday_id)
+        .filter(EmployeeHolidaySelection.employee_id == employee_id)
+    )
+    applicable_filters.append(
+        and_(
+            Holiday.holiday_type == "Optional",
+            Holiday.id.in_(selected_holiday_ids),
+        )
+    )
+
+    holiday_rows = (
+        db.query(Holiday.holiday_date)
+        .filter(
+            Holiday.is_active.is_(True),
+            Holiday.holiday_date >= start_date,
+            Holiday.holiday_date <= end_date,
+            or_(*applicable_filters),
+        )
+        .all()
+    )
+
+    holiday_dates = {
+        row[0] for row in holiday_rows if row[0] is not None
+    }
+
+    return weekdays - holiday_dates
 
 def get_approved_leave_impact(
     db: Session,
@@ -179,6 +240,10 @@ def get_approved_leave_impact(
     if period_start > period_end:
         return approved_leave_dates, lop_leave_dates
 
+    working_dates = get_working_dates(
+        db, employee_id, period_start, period_end
+    )
+
     leaves = (
         db.query(LeaveRequest)
         .filter(
@@ -197,7 +262,7 @@ def get_approved_leave_impact(
             continue
 
         for current_date in iter_dates(overlap_start, overlap_end):
-            if current_date.weekday() < 5:
+            if current_date in working_dates:
                 approved_leave_dates.add(current_date)
 
         leave_lop_days = max(0, int(leave.lop_days or 0))
@@ -213,7 +278,7 @@ def get_approved_leave_impact(
             continue
 
         for current_date in iter_dates(lop_overlap_start, lop_overlap_end):
-            if current_date.weekday() < 5:
+            if current_date in working_dates:
                 lop_leave_dates.add(current_date)
 
     return approved_leave_dates, lop_leave_dates
@@ -233,7 +298,7 @@ def calculate_payroll_attendance(
     are treated as unauthorized absences. Weekends are excluded; company holidays
     cannot be excluded until a holiday calendar is configured.
     """
-    working_dates = get_working_dates(period_start, period_end)
+    working_dates = get_working_dates(db, employee_id, period_start, period_end)
     if not working_dates:
         return 0, 0, 0
 

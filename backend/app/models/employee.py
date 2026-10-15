@@ -1,4 +1,4 @@
-
+﻿
 from sqlalchemy import (
     Boolean,
     Column,
@@ -34,6 +34,7 @@ class Employee(Base):
     )
 
     department = Column(String(100), nullable=False)
+    region = Column(String(100), nullable=True, index=True)
     designation = Column(String(100), nullable=False)
     joining_date = Column(Date, nullable=False)
     salary = Column(Numeric(12, 2), nullable=False)
@@ -48,3 +49,4 @@ class Employee(Base):
         server_default=func.now(),
         nullable=False,
     )
+
