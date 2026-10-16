@@ -1,0 +1,703 @@
+import { useEffect, useState } from "react";
+import {
+  Bell,
+  CalendarDays,
+  Check,
+  CheckCheck,
+  Clock3,
+  History,
+  Plus,
+  RefreshCw,
+  Send,
+  ShieldCheck,
+  Trash2,
+  Wallet,
+  X,
+} from "lucide-react";
+import api from "./api";
+
+const NOTIFICATION_CATEGORIES = [
+  "leave",
+  "payroll",
+  "attendance",
+  "announcement",
+  "admin",
+  "system",
+];
+const SHIFT_TYPES = ["General", "Night", "Flexible", "Remote"];
+const COMPONENT_TYPES = ["Earning", "Deduction"];
+const CALCULATION_METHODS = ["Fixed", "PercentOfBasic", "PerOvertimeHour"];
+
+function localDate(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function firstDayOfMonth() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function dateLabel(value) {
+  if (!value) return "—";
+  const text = String(value).slice(0, 10);
+  const date = new Date(`${text}T00:00:00`);
+  return Number.isNaN(date.getTime())
+    ? text
+    : date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function dateTimeLabel(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? String(value)
+    : date.toLocaleString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function money(value, currency = "INR") {
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: currency || "INR",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Number(value || 0));
+}
+
+function getErrorMessage(error) {
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map((entry) => entry.msg || "Invalid input").join(", ");
+  return error?.message || "Something went wrong. Please try again.";
+}
+
+function InlineMessage({ error, notice, dismiss }) {
+  if (!error && !notice) return null;
+  return (
+    <div className={`alert ${error ? "alert-error" : "alert-success"}`} role={error ? "alert" : "status"}>
+      {error ? <X size={18} /> : <Check size={18} />}
+      <span>{error || notice}</span>
+      <button type="button" aria-label="Dismiss message" onClick={dismiss}><X size={16} /></button>
+    </div>
+  );
+}
+
+function PhaseHeader({ eyebrow, title, description, icon: Icon = ShieldCheck, action }) {
+  return (
+    <div className="phase-two-header content-card">
+      <div className="phase-two-header-icon"><Icon size={23} /></div>
+      <div className="phase-two-header-copy">
+        {eyebrow && <span className="phase-two-eyebrow">{eyebrow}</span>}
+        <h2>{title}</h2>
+        <p>{description}</p>
+      </div>
+      {action && <div className="phase-two-header-action">{action}</div>}
+    </div>
+  );
+}
+
+function EmptyRows({ text }) {
+  return <div className="phase-two-empty">{text}</div>;
+}
+
+export default function PhaseTwoPages({ page, user, isManagement, employees = [], employee = null, refreshKey = 0 }) {
+  if (page === "Holiday Calendar") {
+    return <HolidayCalendarPage isManagement={isManagement} employee={employee} refreshKey={refreshKey} />;
+  }
+  if (page === "Notifications") {
+    return <NotificationsPage isManagement={isManagement} user={user} refreshKey={refreshKey} />;
+  }
+  if (page === "Shift Management") {
+    return <ShiftManagementPage user={user} employees={employees} refreshKey={refreshKey} />;
+  }
+  if (page === "Compensation") {
+    return <CompensationPage user={user} employees={employees} refreshKey={refreshKey} />;
+  }
+  return null;
+}
+
+function HolidayCalendarPage({ isManagement, employee, refreshKey }) {
+  const now = new Date();
+  const [monthKey, setMonthKey] = useState(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`);
+  const [region, setRegion] = useState(employee?.region || "");
+  const [calendarItems, setCalendarItems] = useState([]);
+  const [allHolidays, setAllHolidays] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const emptyForm = () => ({ name: "", holiday_date: localDate(), holiday_type: "Company", region: "", description: "", is_active: true });
+  const [form, setForm] = useState(emptyForm);
+  const [showForm, setShowForm] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const [year, month] = monthKey.split("-").map(Number);
+      const calendarParams = { year, month };
+      if (region.trim()) calendarParams.region = region.trim();
+      const requests = [api.get("/holidays/calendar", { params: calendarParams })];
+      if (isManagement) requests.push(api.get("/holidays/", { params: { include_inactive: true } }));
+      const results = await Promise.all(requests);
+      setCalendarItems(Array.isArray(results[0].data) ? results[0].data : []);
+      if (isManagement) setAllHolidays(Array.isArray(results[1].data) ? results[1].data : []);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, [monthKey, region, refreshKey]);
+
+  function startEdit(holiday) {
+    setEditingId(holiday.id);
+    setForm({
+      name: holiday.name || "",
+      holiday_date: String(holiday.holiday_date || "").slice(0, 10),
+      holiday_type: holiday.holiday_type || "Company",
+      region: holiday.region || "",
+      description: holiday.description || "",
+      is_active: Boolean(holiday.is_active),
+    });
+    setShowForm(true);
+    setNotice("");
+    setError("");
+  }
+
+  function resetForm() {
+    setEditingId(null);
+    setForm(emptyForm());
+    setShowForm(false);
+  }
+
+  async function submitHoliday(event) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setNotice("");
+    const payload = {
+      name: form.name.trim(),
+      holiday_date: form.holiday_date,
+      holiday_type: form.holiday_type,
+      region: form.holiday_type === "Regional" ? form.region.trim() : null,
+      description: form.description.trim() || null,
+      ...(editingId ? { is_active: Boolean(form.is_active) } : {}),
+    };
+    try {
+      if (editingId) await api.patch(`/holidays/${editingId}`, payload);
+      else await api.post("/holidays/", payload);
+      setNotice(editingId ? "Holiday updated successfully." : "Holiday created successfully.");
+      resetForm();
+      await load();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deactivateHoliday(holiday) {
+    if (!window.confirm(`Deactivate holiday “${holiday.name}”? It will remain in historical records.`)) return;
+    setError("");
+    setNotice("");
+    try {
+      await api.delete(`/holidays/${holiday.id}`);
+      setNotice("Holiday deactivated.");
+      await load();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  }
+
+  async function selectOptional(holiday) {
+    setError("");
+    setNotice("");
+    try {
+      if (holiday.is_selected) await api.delete(`/holidays/${holiday.id}/select`);
+      else await api.post(`/holidays/${holiday.id}/select`);
+      setNotice(holiday.is_selected ? "Optional holiday selection cancelled." : "Optional holiday selected.");
+      await load();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  }
+
+  const selectedMonthLabel = new Date(`${monthKey}-01T00:00:00`).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+  const today = localDate();
+
+  return (
+    <div className="phase-two">
+      <PhaseHeader eyebrow="TIME OFF & CALENDAR" title="Holiday Calendar" description="View company, regional and optional holidays. Admin and HR can manage the holiday schedule." icon={CalendarDays}
+        action={isManagement && <button className="primary-button" type="button" onClick={() => { setShowForm(true); setEditingId(null); setForm(emptyForm()); }}><Plus size={17} /> Add holiday</button>} />
+      <InlineMessage error={error} notice={notice} dismiss={() => { setError(""); setNotice(""); }} />
+
+      <section className="content-card">
+        <div className="section-heading">
+          <div><h2>{selectedMonthLabel}</h2><p>{calendarItems.length} active holiday{calendarItems.length === 1 ? "" : "s"} this month</p></div>
+          <div className="phase-two-toolbar">
+            <label className="phase-two-filter-label">Month <input type="month" value={monthKey} onChange={(event) => setMonthKey(event.target.value)} /></label>
+            <label className="phase-two-filter-label">Region <input value={region} placeholder="All regions" onChange={(event) => setRegion(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void load(); }} /></label>
+            <button className="secondary-button" type="button" onClick={() => void load()} disabled={loading}><RefreshCw size={15} /> Refresh</button>
+          </div>
+        </div>
+        {loading ? <EmptyRows text="Loading holiday calendar…" /> : calendarItems.length === 0 ? <EmptyRows text="No holidays are configured for this month and region." /> : (
+          <div className="phase-two-holiday-list">
+            {calendarItems.map((holiday) => (
+              <article className="phase-two-holiday-row" key={holiday.id}>
+                <div className="phase-two-date-tile"><strong>{String(holiday.holiday_date).slice(8, 10)}</strong><span>{new Date(`${String(holiday.holiday_date).slice(0, 10)}T00:00:00`).toLocaleDateString("en-IN", { month: "short" })}</span></div>
+                <div className="phase-two-row-main"><strong>{holiday.name}</strong><p>{holiday.description || (holiday.region ? `Applies to ${holiday.region}` : "Organization holiday")}</p><div className="phase-two-chips"><span className={`phase-two-chip phase-two-chip-${String(holiday.holiday_type).toLowerCase()}`}>{holiday.holiday_type}</span>{holiday.region && <span className="phase-two-chip">{holiday.region}</span>}{holiday.is_selected && <span className="phase-two-chip phase-two-chip-selected">Selected</span>}</div></div>
+                {holiday.holiday_type === "Optional" && !isManagement && String(holiday.holiday_date).slice(0, 10) >= today && <button type="button" className={holiday.is_selected ? "secondary-button" : "primary-button"} onClick={() => void selectOptional(holiday)}>{holiday.is_selected ? <X size={15} /> : <Check size={15} />}{holiday.is_selected ? "Cancel selection" : "Select holiday"}</button>}
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {isManagement && showForm && (
+        <section className="content-card">
+          <div className="section-heading"><div><h2>{editingId ? "Edit holiday" : "Create holiday"}</h2><p>Regional holidays must include a region. Non-regional holidays are saved without one.</p></div><button type="button" className="secondary-button" onClick={resetForm}>Cancel</button></div>
+          <form className="data-form" onSubmit={submitHoliday}>
+            <label className="form-field"><span>Holiday name <b>*</b></span><input required minLength={2} maxLength={150} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label className="form-field"><span>Date <b>*</b></span><input type="date" required value={form.holiday_date} onChange={(e) => setForm({ ...form, holiday_date: e.target.value })} /></label>
+            <label className="form-field"><span>Type <b>*</b></span><select value={form.holiday_type} onChange={(e) => setForm({ ...form, holiday_type: e.target.value })}><option>Company</option><option>Regional</option><option>Optional</option></select></label>
+            {form.holiday_type === "Regional" && <label className="form-field"><span>Region <b>*</b></span><input required maxLength={100} value={form.region} onChange={(e) => setForm({ ...form, region: e.target.value })} placeholder="e.g. Tamil Nadu" /></label>}
+            <label className="form-field form-field-full"><span>Description</span><textarea rows={3} maxLength={2000} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
+            {editingId && <label className="form-field"><span>Status</span><select value={form.is_active ? "active" : "inactive"} onChange={(e) => setForm({ ...form, is_active: e.target.value === "active" })}><option value="active">Active</option><option value="inactive">Inactive</option></select></label>}
+            <div className="form-actions"><button className="primary-button" type="submit" disabled={saving}>{saving ? "Saving…" : editingId ? "Save changes" : "Create holiday"}</button><button className="secondary-button" type="button" onClick={resetForm}>Cancel</button></div>
+          </form>
+        </section>
+      )}
+
+      {isManagement && <section className="content-card"><div className="section-heading"><div><h2>Holiday administration</h2><p>{allHolidays.length} total record{allHolidays.length === 1 ? "" : "s"}, including inactive history</p></div></div>
+        {allHolidays.length === 0 ? <EmptyRows text="No holiday records yet." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Holiday</th><th>Date</th><th>Type / Region</th><th>Status</th><th>Actions</th></tr></thead><tbody>{allHolidays.map((holiday) => <tr key={holiday.id}><td className="table-primary">{holiday.name}<div className="table-secondary">{holiday.description || "—"}</div></td><td>{dateLabel(holiday.holiday_date)}</td><td>{holiday.holiday_type}{holiday.region ? ` · ${holiday.region}` : ""}</td><td><span className={`status-badge status-${holiday.is_active ? "active" : "inactive"}`}><span className="status-dot" />{holiday.is_active ? "Active" : "Inactive"}</span></td><td><div className="table-action-buttons"><button type="button" className="small-action-button employee-action-edit" onClick={() => startEdit(holiday)}>Edit</button>{holiday.is_active && <button type="button" className="small-action-button employee-action-deactivate" onClick={() => void deactivateHoliday(holiday)}>Deactivate</button>}</div></td></tr>)}</tbody></table></div>}
+      </section>}
+    </div>
+  );
+}
+
+function NotificationsPage({ isManagement, user, refreshKey }) {
+  const [items, setItems] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [preferences, setPreferences] = useState([]);
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [savingPreference, setSavingPreference] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [broadcastForm, setBroadcastForm] = useState({ title: "", message: "", category: "announcement", department: "" });
+  const [broadcasting, setBroadcasting] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const results = await Promise.all([
+        api.get("/notifications/me", { params: { unread_only: unreadOnly, skip: 0, limit: 100 } }),
+        api.get("/notifications/me/unread-count"),
+        api.get("/notifications/preferences"),
+      ]);
+      setItems(Array.isArray(results[0].data) ? results[0].data : []);
+      setUnreadCount(Number(results[1].data?.unread_count || 0));
+      setPreferences(Array.isArray(results[2].data) ? results[2].data : []);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, [refreshKey, unreadOnly]);
+
+  async function markRead(item) {
+    setError("");
+    try {
+      await api.patch(`/notifications/${item.id}/read`);
+      setItems((previous) => previous.map((notification) => notification.id === item.id ? { ...notification, is_read: true, read_at: new Date().toISOString() } : notification));
+      setUnreadCount((previous) => Math.max(0, previous - (item.is_read ? 0 : 1)));
+    } catch (err) { setError(getErrorMessage(err)); }
+  }
+
+  async function markAllRead() {
+    setError("");
+    setNotice("");
+    try {
+      await api.patch("/notifications/me/read-all");
+      setItems((previous) => previous.map((item) => ({ ...item, is_read: true, read_at: item.read_at || new Date().toISOString() })));
+      setUnreadCount(0);
+      setNotice("All notifications marked as read.");
+    } catch (err) { setError(getErrorMessage(err)); }
+  }
+
+  async function savePreference(category, enabled) {
+    setSavingPreference(category);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.put("/notifications/preferences", { category, enabled });
+      setPreferences((previous) => previous.map((item) => item.category === category ? response.data : item));
+      setNotice(`${category} notifications ${enabled ? "enabled" : "disabled"}.`);
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSavingPreference(""); }
+  }
+
+  async function broadcast(event) {
+    event.preventDefault();
+    setBroadcasting(true);
+    setError("");
+    setNotice("");
+    try {
+      const payload = { title: broadcastForm.title.trim(), message: broadcastForm.message.trim(), category: broadcastForm.category, department: broadcastForm.department.trim() || null };
+      const response = await api.post("/notifications/broadcast", payload);
+      setNotice(`Broadcast processed. Created ${response.data?.notifications_created ?? 0} notifications for ${response.data?.eligible_users ?? 0} eligible users.`);
+      setBroadcastForm({ title: "", message: "", category: "announcement", department: "" });
+      await load();
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setBroadcasting(false); }
+  }
+
+  return (
+    <div className="phase-two">
+      <PhaseHeader eyebrow="PEOPLE UPDATES" title="Notifications" description="Review HR updates and manage which notification categories you receive." icon={Bell}
+        action={<div className="phase-two-unread-counter"><strong>{unreadCount}</strong><span>unread</span></div>} />
+      <InlineMessage error={error} notice={notice} dismiss={() => { setError(""); setNotice(""); }} />
+
+      <section className="content-card">
+        <div className="section-heading"><div><h2>Notification inbox</h2><p>{items.length} displayed · {unreadCount} unread in total</p></div><div className="phase-two-toolbar"><label className="phase-two-check"><input type="checkbox" checked={unreadOnly} onChange={(e) => setUnreadOnly(e.target.checked)} /> Unread only</label><button type="button" className="secondary-button" onClick={() => void load()} disabled={loading}><RefreshCw size={15} /> Refresh</button><button type="button" className="secondary-button" onClick={() => void markAllRead()} disabled={unreadCount === 0}><CheckCheck size={15} /> Mark all read</button></div></div>
+        {loading ? <EmptyRows text="Loading notifications…" /> : items.length === 0 ? <EmptyRows text={unreadOnly ? "You have no unread notifications." : "Your inbox is clear. Notifications will appear here."} /> : <div className="phase-two-notification-list">{items.map((item) => <article className={`phase-two-notification ${item.is_read ? "phase-two-notification-read" : "phase-two-notification-unread"}`} key={item.id}><div className="phase-two-notification-icon"><Bell size={18} /></div><div className="phase-two-row-main"><div className="phase-two-notification-heading"><strong>{item.title}</strong><span className="phase-two-chip">{item.category}</span></div><p>{item.message}</p><span className="phase-two-muted">{dateTimeLabel(item.created_at)}</span></div>{!item.is_read && <button type="button" className="small-action-button small-action-lock" onClick={() => void markRead(item)}><Check size={14} /> Mark read</button>}</article>)}</div>}
+      </section>
+
+      <section className="content-card"><div className="section-heading"><div><h2>Notification preferences</h2><p>Disabled categories will suppress new in-app notifications for that category.</p></div></div><div className="phase-two-preference-grid">{NOTIFICATION_CATEGORIES.map((category) => { const pref = preferences.find((item) => item.category === category); const enabled = pref?.enabled !== false; return <label className="phase-two-preference" key={category}><span><strong>{category.charAt(0).toUpperCase() + category.slice(1)}</strong><small>{category === "announcement" ? "Company and department messages" : category === "system" ? "System-related updates" : `${category.charAt(0).toUpperCase() + category.slice(1)} workflow updates`}</small></span><input type="checkbox" checked={enabled} disabled={savingPreference === category} onChange={(e) => void savePreference(category, e.target.checked)} /></label>; })}</div></section>
+
+      {isManagement && <section className="content-card"><div className="section-heading"><div><h2>Broadcast a notification</h2><p>Send an in-app message to all active users or to a department.</p></div><div className="section-heading-icon"><Send size={19} /></div></div><form className="data-form" onSubmit={broadcast}><label className="form-field"><span>Title <b>*</b></span><input required minLength={2} maxLength={150} value={broadcastForm.title} onChange={(e) => setBroadcastForm({ ...broadcastForm, title: e.target.value })} /></label><label className="form-field"><span>Category <b>*</b></span><select value={broadcastForm.category} onChange={(e) => setBroadcastForm({ ...broadcastForm, category: e.target.value })}><option value="announcement">Announcement</option><option value="admin">Admin</option></select></label><label className="form-field"><span>Department (optional)</span><input maxLength={100} value={broadcastForm.department} onChange={(e) => setBroadcastForm({ ...broadcastForm, department: e.target.value })} placeholder="Leave blank for all active users" /></label><label className="form-field form-field-full"><span>Message <b>*</b></span><textarea required minLength={1} maxLength={5000} rows={4} value={broadcastForm.message} onChange={(e) => setBroadcastForm({ ...broadcastForm, message: e.target.value })} /></label><div className="form-actions"><button className="primary-button" type="submit" disabled={broadcasting}><Send size={16} />{broadcasting ? "Sending…" : "Send broadcast"}</button></div></form></section>}
+    </div>
+  );
+}
+
+function ShiftManagementPage({ user, employees, refreshKey }) {
+  const [shifts, setShifts] = useState([]);
+  const [assignments, setAssignments] = useState([]);
+  const [employeeOptions, setEmployeeOptions] = useState(employees || []);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [report, setReport] = useState(null);
+  const [reportStart, setReportStart] = useState(firstDayOfMonth());
+  const [reportEnd, setReportEnd] = useState(localDate());
+  const [historyItems, setHistoryItems] = useState(null);
+  const [historyAssignment, setHistoryAssignment] = useState(null);
+  const [overrideId, setOverrideId] = useState(null);
+  const [overrideForm, setOverrideForm] = useState({ shift_id: "", effective_from: localDate(), effective_to: "", reason: "" });
+  const [shiftForm, setShiftForm] = useState({ name: "", shift_type: "General", start_time: "09:00", end_time: "18:00", grace_period_minutes: "10", expected_work_minutes: "480", description: "" });
+  const [assignmentForm, setAssignmentForm] = useState({ target_type: "employee", shift_id: "", employee_id: "", department: "", effective_from: localDate(), effective_to: "" });
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const [shiftResponse, assignmentResponse, employeeResponse] = await Promise.all([
+        api.get("/shifts/"),
+        api.get("/shifts/assignments"),
+        api.get("/employees/", { params: { include_inactive: false } }),
+      ]);
+      const shiftRows = Array.isArray(shiftResponse.data) ? shiftResponse.data : [];
+      setShifts(shiftRows);
+      setAssignments(Array.isArray(assignmentResponse.data) ? assignmentResponse.data : []);
+      const employeeRows = Array.isArray(employeeResponse.data) ? employeeResponse.data : (employees || []);
+      setEmployeeOptions(employeeRows.filter((employee) => employee.is_active !== false));
+      setAssignmentForm((previous) => ({ ...previous, shift_id: previous.shift_id || String(shiftRows[0]?.id || "") }));
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, [refreshKey]);
+
+  async function createShift(event) {
+    event.preventDefault();
+    setSaving(true); setError(""); setNotice("");
+    const payload = {
+      name: shiftForm.name.trim(),
+      shift_type: shiftForm.shift_type,
+      start_time: shiftForm.shift_type === "Flexible" && !shiftForm.start_time ? null : shiftForm.start_time || null,
+      end_time: shiftForm.shift_type === "Flexible" && !shiftForm.end_time ? null : shiftForm.end_time || null,
+      grace_period_minutes: Number(shiftForm.grace_period_minutes),
+      expected_work_minutes: Number(shiftForm.expected_work_minutes),
+      description: shiftForm.description.trim() || null,
+      is_active: true,
+    };
+    try {
+      await api.post("/shifts/", payload);
+      setNotice("Shift created successfully.");
+      setShiftForm({ name: "", shift_type: "General", start_time: "09:00", end_time: "18:00", grace_period_minutes: "10", expected_work_minutes: "480", description: "" });
+      await load();
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSaving(false); }
+  }
+
+  async function deactivateShift(shift) {
+    if (!window.confirm(`Deactivate “${shift.name}”? Existing assignment history will be retained.`)) return;
+    setError(""); setNotice("");
+    try { await api.delete(`/shifts/${shift.id}`); setNotice("Shift deactivated."); await load(); }
+    catch (err) { setError(getErrorMessage(err)); }
+  }
+
+  async function createAssignment(event) {
+    event.preventDefault(); setSaving(true); setError(""); setNotice("");
+    const payload = {
+      shift_id: Number(assignmentForm.shift_id),
+      effective_from: assignmentForm.effective_from,
+      effective_to: assignmentForm.effective_to || null,
+      ...(assignmentForm.target_type === "employee" ? { employee_id: Number(assignmentForm.employee_id) } : { department: assignmentForm.department.trim() }),
+    };
+    try {
+      await api.post("/shifts/assignments", payload);
+      setNotice("Shift assignment created successfully.");
+      setAssignmentForm((previous) => ({ ...previous, employee_id: "", department: "", effective_from: localDate(), effective_to: "" }));
+      await load();
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSaving(false); }
+  }
+
+  async function loadReport(event) {
+    if (event) event.preventDefault();
+    setError(""); setReport(null);
+    try {
+      const response = await api.get("/shifts/reports/attendance", { params: { start_date: reportStart, end_date: reportEnd, limit: 500 } });
+      setReport(response.data);
+    } catch (err) { setError(getErrorMessage(err)); }
+  }
+
+  async function loadHistory(assignment) {
+    setError(""); setHistoryAssignment(assignment); setHistoryItems(null);
+    try {
+      const response = await api.get(`/shifts/assignments/${assignment.id}/history`);
+      setHistoryItems(Array.isArray(response.data) ? response.data : []);
+    } catch (err) { setError(getErrorMessage(err)); setHistoryItems([]); }
+  }
+
+  function beginOverride(assignment) {
+    setOverrideId(assignment.id);
+    setOverrideForm({ shift_id: String(assignment.shift_id), effective_from: String(assignment.effective_from).slice(0, 10), effective_to: assignment.effective_to ? String(assignment.effective_to).slice(0, 10) : "", reason: "" });
+  }
+
+  async function saveOverride(event) {
+    event.preventDefault(); setError(""); setNotice(""); setSaving(true);
+    try {
+      await api.patch(`/shifts/assignments/${overrideId}/override`, { shift_id: Number(overrideForm.shift_id), effective_from: overrideForm.effective_from, effective_to: overrideForm.effective_to || null, reason: overrideForm.reason.trim() });
+      setNotice("Shift assignment override saved."); setOverrideId(null); await load();
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSaving(false); }
+  }
+
+  const employeeName = (id) => {
+    const employee = employeeOptions.find((row) => Number(row.id) === Number(id));
+    return employee ? `${employee.employee_code || `Employee #${employee.id}`}${employee.department ? ` · ${employee.department}` : ""}` : (id ? `Employee #${id}` : "Department assignment");
+  };
+  const shiftName = (id) => shifts.find((row) => Number(row.id) === Number(id))?.name || `Shift #${id}`;
+  const isAdmin = user?.role === "Admin";
+  const reportRows = report?.records || [];
+
+  return (
+    <div className="phase-two">
+      <PhaseHeader eyebrow="WORK SCHEDULES" title="Shift Management" description="Configure work shifts, assign them by employee or department, and review attendance metrics." icon={Clock3} action={<button type="button" className="secondary-button" onClick={() => void load()} disabled={loading}><RefreshCw size={15} /> Refresh</button>} />
+      <InlineMessage error={error} notice={notice} dismiss={() => { setError(""); setNotice(""); }} />
+
+      <section className="content-card"><div className="section-heading"><div><h2>Create a shift</h2><p>Fixed shifts require both start and end times. Flexible shifts may omit them.</p></div></div>
+        <form className="data-form" onSubmit={createShift}>
+          <label className="form-field"><span>Shift name <b>*</b></span><input required minLength={2} maxLength={100} value={shiftForm.name} onChange={(e) => setShiftForm({ ...shiftForm, name: e.target.value })} /></label>
+          <label className="form-field"><span>Type <b>*</b></span><select value={shiftForm.shift_type} onChange={(e) => setShiftForm({ ...shiftForm, shift_type: e.target.value })}>{SHIFT_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
+          <label className="form-field"><span>Start time {shiftForm.shift_type !== "Flexible" && <b>*</b>}</span><input type="time" required={shiftForm.shift_type !== "Flexible"} value={shiftForm.start_time} onChange={(e) => setShiftForm({ ...shiftForm, start_time: e.target.value })} /></label>
+          <label className="form-field"><span>End time {shiftForm.shift_type !== "Flexible" && <b>*</b>}</span><input type="time" required={shiftForm.shift_type !== "Flexible"} value={shiftForm.end_time} onChange={(e) => setShiftForm({ ...shiftForm, end_time: e.target.value })} /></label>
+          <label className="form-field"><span>Grace period (minutes) <b>*</b></span><input type="number" required min="0" max="240" value={shiftForm.grace_period_minutes} onChange={(e) => setShiftForm({ ...shiftForm, grace_period_minutes: e.target.value })} /></label>
+          <label className="form-field"><span>Expected work (minutes) <b>*</b></span><input type="number" required min="1" max="1440" value={shiftForm.expected_work_minutes} onChange={(e) => setShiftForm({ ...shiftForm, expected_work_minutes: e.target.value })} /></label>
+          <label className="form-field form-field-full"><span>Description</span><textarea rows={2} maxLength={2000} value={shiftForm.description} onChange={(e) => setShiftForm({ ...shiftForm, description: e.target.value })} /></label>
+          <div className="form-actions"><button className="primary-button" type="submit" disabled={saving || (shiftForm.shift_type !== "Flexible" && (!shiftForm.start_time || !shiftForm.end_time || shiftForm.start_time === shiftForm.end_time))}><Plus size={16} />{saving ? "Saving…" : "Create shift"}</button></div>
+        </form>
+      </section>
+
+      <section className="content-card"><div className="section-heading"><div><h2>Shift catalogue</h2><p>{shifts.length} active shift{shifts.length === 1 ? "" : "s"}</p></div></div>
+        {loading ? <EmptyRows text="Loading shifts…" /> : shifts.length === 0 ? <EmptyRows text="No active shifts found." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Shift</th><th>Schedule</th><th>Grace</th><th>Expected minutes</th><th>Actions</th></tr></thead><tbody>{shifts.map((shift) => <tr key={shift.id}><td className="table-primary">{shift.name}<div className="table-secondary">{shift.shift_type}{shift.description ? ` · ${shift.description}` : ""}</div></td><td>{shift.start_time ? String(shift.start_time).slice(0, 5) : "Flexible"} – {shift.end_time ? String(shift.end_time).slice(0, 5) : "Flexible"}</td><td>{shift.grace_period_minutes} min</td><td>{shift.expected_work_minutes}</td><td><button type="button" className="small-action-button employee-action-deactivate" onClick={() => void deactivateShift(shift)}>Deactivate</button></td></tr>)}</tbody></table></div>}
+      </section>
+
+      <section className="content-card"><div className="section-heading"><div><h2>Assign a shift</h2><p>Choose exactly one assignment target: an employee or a department.</p></div></div>
+        <form className="data-form" onSubmit={createAssignment}>
+          <label className="form-field"><span>Shift <b>*</b></span><select required value={assignmentForm.shift_id} onChange={(e) => setAssignmentForm({ ...assignmentForm, shift_id: e.target.value })}><option value="">Choose shift</option>{shifts.map((shift) => <option key={shift.id} value={shift.id}>{shift.name}</option>)}</select></label>
+          <label className="form-field"><span>Assign to <b>*</b></span><select value={assignmentForm.target_type} onChange={(e) => setAssignmentForm({ ...assignmentForm, target_type: e.target.value, employee_id: "", department: "" })}><option value="employee">Employee</option><option value="department">Department</option></select></label>
+          {assignmentForm.target_type === "employee" ? <label className="form-field"><span>Employee <b>*</b></span><select required value={assignmentForm.employee_id} onChange={(e) => setAssignmentForm({ ...assignmentForm, employee_id: e.target.value })}><option value="">Choose employee</option>{employeeOptions.map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_code || `Employee #${employee.id}`} · {employee.department || "No department"}</option>)}</select></label> : <label className="form-field"><span>Department <b>*</b></span><input required minLength={1} maxLength={100} value={assignmentForm.department} onChange={(e) => setAssignmentForm({ ...assignmentForm, department: e.target.value })} placeholder="e.g. IT" /></label>}
+          <label className="form-field"><span>Effective from <b>*</b></span><input type="date" required value={assignmentForm.effective_from} onChange={(e) => setAssignmentForm({ ...assignmentForm, effective_from: e.target.value })} /></label>
+          <label className="form-field"><span>Effective to</span><input type="date" min={assignmentForm.effective_from} value={assignmentForm.effective_to} onChange={(e) => setAssignmentForm({ ...assignmentForm, effective_to: e.target.value })} /></label>
+          <div className="form-actions"><button className="primary-button" type="submit" disabled={saving || shifts.length === 0 || (assignmentForm.target_type === "employee" && !assignmentForm.employee_id)}><Plus size={16} />Create assignment</button></div>
+        </form>
+      </section>
+
+      <section className="content-card"><div className="section-heading"><div><h2>Assignment history</h2><p>Effective-dated assignments remain available for audit.</p></div></div>
+        {assignments.length === 0 ? <EmptyRows text="No shift assignments have been created yet." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Target</th><th>Shift</th><th>Effective period</th><th>Assigned by</th><th>Actions</th></tr></thead><tbody>{assignments.map((assignment) => <tr key={assignment.id}><td className="table-primary">{employeeName(assignment.employee_id)}{assignment.department && assignment.employee_id == null ? <div className="table-secondary">Department: {assignment.department}</div> : null}</td><td>{shiftName(assignment.shift_id)}</td><td>{dateLabel(assignment.effective_from)} – {dateLabel(assignment.effective_to)}</td><td>{assignment.assigned_by}</td><td><div className="table-action-buttons"><button type="button" className="small-action-button small-action-lock" onClick={() => void loadHistory(assignment)}><History size={13} /> History</button>{isAdmin && <button type="button" className="small-action-button employee-action-edit" onClick={() => beginOverride(assignment)}>Override</button>}</div></td></tr>)}</tbody></table></div>}
+      </section>
+
+      {overrideId && <section className="content-card"><div className="section-heading"><div><h2>Override assignment #{overrideId}</h2><p>Admin-only correction. A reason is required for the audit trail.</p></div><button type="button" className="secondary-button" onClick={() => setOverrideId(null)}>Cancel</button></div><form className="data-form" onSubmit={saveOverride}><label className="form-field"><span>Replacement shift <b>*</b></span><select required value={overrideForm.shift_id} onChange={(e) => setOverrideForm({ ...overrideForm, shift_id: e.target.value })}>{shifts.map((shift) => <option key={shift.id} value={shift.id}>{shift.name}</option>)}</select></label><label className="form-field"><span>Effective from <b>*</b></span><input type="date" required value={overrideForm.effective_from} onChange={(e) => setOverrideForm({ ...overrideForm, effective_from: e.target.value })} /></label><label className="form-field"><span>Effective to</span><input type="date" min={overrideForm.effective_from} value={overrideForm.effective_to} onChange={(e) => setOverrideForm({ ...overrideForm, effective_to: e.target.value })} /></label><label className="form-field form-field-full"><span>Reason <b>*</b></span><textarea required minLength={3} maxLength={500} rows={3} value={overrideForm.reason} onChange={(e) => setOverrideForm({ ...overrideForm, reason: e.target.value })} /></label><div className="form-actions"><button className="primary-button" type="submit" disabled={saving}>Save override</button></div></form></section>}
+
+      {historyAssignment && <section className="content-card"><div className="section-heading"><div><h2>Assignment audit history</h2><p>Assignment #{historyAssignment.id} · {shiftName(historyAssignment.shift_id)}</p></div><button type="button" className="secondary-button" onClick={() => { setHistoryAssignment(null); setHistoryItems(null); }}>Close</button></div>{historyItems === null ? <EmptyRows text="Loading audit history…" /> : historyItems.length === 0 ? <EmptyRows text="No audit entries recorded for this assignment." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>{historyItems.map((item) => <tr key={item.id}><td>{dateTimeLabel(item.created_at)}</td><td>{item.actor_name} · {item.actor_role}</td><td>{item.action}</td><td><code className="phase-two-json">{JSON.stringify(item.details || {})}</code></td></tr>)}</tbody></table></div>}</section>}
+
+      <section className="content-card"><div className="section-heading"><div><h2>Attendance report</h2><p>Late arrivals, early checkouts and overtime derived from recorded attendance.</p></div><div className="section-heading-icon"><Clock3 size={19} /></div></div><form className="data-form phase-two-report-form" onSubmit={loadReport}><label className="form-field"><span>Start date <b>*</b></span><input type="date" required value={reportStart} onChange={(e) => setReportStart(e.target.value)} /></label><label className="form-field"><span>End date <b>*</b></span><input type="date" min={reportStart} required value={reportEnd} onChange={(e) => setReportEnd(e.target.value)} /></label><div className="form-actions"><button type="submit" className="primary-button"><RefreshCw size={15} />Run report</button></div></form>
+        {report && <><div className="phase-two-metric-grid"><div><span>Records</span><strong>{report.returned_records}</strong></div><div><span>Late arrivals</span><strong>{report.late_count}</strong></div><div><span>Early checkouts</span><strong>{report.early_checkout_count}</strong></div><div><span>Overtime hours</span><strong>{(Number(report.total_overtime_minutes || 0) / 60).toFixed(2)}</strong></div></div>{reportRows.length === 0 ? <EmptyRows text="No attendance records matched this period." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Date</th><th>Employee</th><th>Shift</th><th>Late</th><th>Early checkout</th><th>Overtime minutes</th></tr></thead><tbody>{reportRows.map((row) => <tr key={row.id}><td>{dateLabel(row.attendance_date)}</td><td>{employeeName(row.employee_id)}</td><td>{row.shift_name || (row.assigned_shift_id ? shiftName(row.assigned_shift_id) : "Unassigned")}</td><td>{row.is_late ? "Yes" : "No"}</td><td>{row.is_early_checkout ? "Yes" : "No"}</td><td>{row.overtime_minutes || 0}</td></tr>)}</tbody></table></div>}</>}
+      </section>
+    </div>
+  );
+}
+
+function blankComponent() {
+  return { component_name: "", component_type: "Earning", calculation_method: "Fixed", amount: "0.00", is_taxable: false, is_recurring: true };
+}
+
+function CompensationPage({ user, employees, refreshKey }) {
+  const [structures, setStructures] = useState([]);
+  const [employeeOptions, setEmployeeOptions] = useState(employees || []);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [form, setForm] = useState({ employee_id: "", structure_name: "", effective_from: localDate(), effective_to: "", basic_salary: "", currency: "INR", notes: "" });
+  const [components, setComponents] = useState([]);
+  const [selectedPreviewId, setSelectedPreviewId] = useState("");
+  const [overtimeHours, setOvertimeHours] = useState("0");
+  const [includeNonRecurring, setIncludeNonRecurring] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [historyId, setHistoryId] = useState(null);
+  const [historyRows, setHistoryRows] = useState(null);
+  const [closing, setClosing] = useState(null);
+  const [closeForm, setCloseForm] = useState({ effective_to: localDate(), reason: "" });
+
+  async function load() {
+    setLoading(true); setError("");
+    try {
+      const [structureResponse, employeeResponse] = await Promise.all([
+        api.get("/compensation/structures", { params: { limit: 500 } }),
+        api.get("/employees/", { params: { include_inactive: false } }),
+      ]);
+      const rows = Array.isArray(structureResponse.data) ? structureResponse.data : [];
+      setStructures(rows);
+      setEmployeeOptions((Array.isArray(employeeResponse.data) ? employeeResponse.data : (employees || [])).filter((employee) => employee.is_active !== false));
+      setSelectedPreviewId((previous) => previous || String(rows[0]?.id || ""));
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { void load(); }, [refreshKey]);
+
+  function updateComponent(index, field, value) {
+    setComponents((previous) => previous.map((component, currentIndex) => currentIndex === index ? { ...component, [field]: value } : component));
+  }
+
+  async function createStructure(event) {
+    event.preventDefault(); setSaving(true); setError(""); setNotice("");
+    const payload = {
+      employee_id: Number(form.employee_id),
+      structure_name: form.structure_name.trim(),
+      effective_from: form.effective_from,
+      effective_to: form.effective_to || null,
+      basic_salary: Number(form.basic_salary),
+      currency: form.currency,
+      notes: form.notes.trim() || null,
+      components: components.map((component) => ({
+        component_name: component.component_name.trim(),
+        component_type: component.component_type,
+        calculation_method: component.calculation_method,
+        amount: Number(component.amount),
+        is_taxable: Boolean(component.is_taxable),
+        is_recurring: Boolean(component.is_recurring),
+      })),
+    };
+    try {
+      const response = await api.post("/compensation/structures", payload);
+      setNotice(`Compensation structure created for employee #${response.data.employee_id}.`);
+      setForm({ employee_id: "", structure_name: "", effective_from: localDate(), effective_to: "", basic_salary: "", currency: "INR", notes: "" });
+      setComponents([]);
+      await load();
+      setSelectedPreviewId(String(response.data.id));
+      setPreview(null);
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSaving(false); }
+  }
+
+  async function runPreview(event) {
+    event.preventDefault(); setPreviewLoading(true); setError(""); setNotice(""); setPreview(null);
+    try {
+      const response = await api.post(`/compensation/structures/${Number(selectedPreviewId)}/preview`, { overtime_hours: Number(overtimeHours), include_non_recurring: includeNonRecurring });
+      setPreview(response.data);
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setPreviewLoading(false); }
+  }
+
+  async function loadHistory(structure) {
+    setHistoryId(structure.id); setHistoryRows(null); setError("");
+    try { const response = await api.get(`/compensation/structures/${structure.id}/history`); setHistoryRows(Array.isArray(response.data) ? response.data : []); }
+    catch (err) { setError(getErrorMessage(err)); setHistoryRows([]); }
+  }
+
+  async function closeStructure(event) {
+    event.preventDefault(); setSaving(true); setError(""); setNotice("");
+    try {
+      await api.patch(`/compensation/structures/${closing.id}/close`, { effective_to: closeForm.effective_to, reason: closeForm.reason.trim() });
+      setNotice(`Compensation structure #${closing.id} closed with effective end date ${dateLabel(closeForm.effective_to)}.`);
+      setClosing(null); setCloseForm({ effective_to: localDate(), reason: "" }); await load();
+    } catch (err) { setError(getErrorMessage(err)); }
+    finally { setSaving(false); }
+  }
+
+  const isAdmin = user?.role === "Admin";
+  const selectedStructure = structures.find((structure) => String(structure.id) === String(selectedPreviewId));
+
+  return (
+    <div className="phase-two">
+      <PhaseHeader eyebrow="SALARY RULES & VERSIONS" title="Compensation Management" description="Create effective-dated salary structures, configure earnings and deductions, and preview estimates without generating payroll." icon={Wallet} action={<button type="button" className="secondary-button" onClick={() => void load()} disabled={loading}><RefreshCw size={15} /> Refresh</button>} />
+      <InlineMessage error={error} notice={notice} dismiss={() => { setError(""); setNotice(""); }} />
+
+      <section className="content-card"><div className="section-heading"><div><h2>Create a compensation structure</h2><p>Submitting this form creates a persisted version for the selected employee. It does not generate a payroll record.</p></div></div>
+        <form className="data-form" onSubmit={createStructure}>
+          <label className="form-field"><span>Employee <b>*</b></span><select required value={form.employee_id} onChange={(e) => setForm({ ...form, employee_id: e.target.value })}><option value="">Choose active employee</option>{employeeOptions.map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_code || `Employee #${employee.id}`} · {employee.department || "No department"}</option>)}</select></label>
+          <label className="form-field"><span>Structure name <b>*</b></span><input required minLength={2} maxLength={100} value={form.structure_name} onChange={(e) => setForm({ ...form, structure_name: e.target.value })} placeholder="e.g. Standard salary FY2026" /></label>
+          <label className="form-field"><span>Basic salary <b>*</b></span><input type="number" required min="0.01" step="0.01" value={form.basic_salary} onChange={(e) => setForm({ ...form, basic_salary: e.target.value })} /></label>
+          <label className="form-field"><span>Effective from <b>*</b></span><input type="date" required value={form.effective_from} onChange={(e) => setForm({ ...form, effective_from: e.target.value })} /></label>
+          <label className="form-field"><span>Effective to</span><input type="date" min={form.effective_from} value={form.effective_to} onChange={(e) => setForm({ ...form, effective_to: e.target.value })} /></label>
+          <label className="form-field"><span>Currency <b>*</b></span><select value={form.currency} onChange={(e) => setForm({ ...form, currency: e.target.value })}><option value="INR">INR — Indian Rupee</option><option value="USD">USD — US Dollar</option><option value="GBP">GBP — Pound Sterling</option><option value="EUR">EUR — Euro</option></select></label>
+          <label className="form-field form-field-full"><span>Notes</span><textarea rows={2} maxLength={2000} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></label>
+          <div className="phase-two-components-wrap form-field-full"><div className="phase-two-subheading"><div><strong>Compensation components</strong><small>Fixed amount, percentage of basic, or rate per overtime hour.</small></div><button className="secondary-button" type="button" onClick={() => setComponents((previous) => [...previous, blankComponent()])}><Plus size={15} /> Add component</button></div>
+            {components.length === 0 ? <EmptyRows text="No additional components added. Basic salary is included automatically." /> : components.map((component, index) => <div className="phase-two-component-row" key={index}>
+              <label className="form-field"><span>Component name <b>*</b></span><input required minLength={2} maxLength={100} value={component.component_name} onChange={(e) => updateComponent(index, "component_name", e.target.value)} /></label>
+              <label className="form-field"><span>Type</span><select value={component.component_type} onChange={(e) => updateComponent(index, "component_type", e.target.value)}>{COMPONENT_TYPES.map((type) => <option key={type}>{type}</option>)}</select></label>
+              <label className="form-field"><span>Calculation</span><select value={component.calculation_method} onChange={(e) => updateComponent(index, "calculation_method", e.target.value)}>{CALCULATION_METHODS.map((method) => <option key={method} value={method}>{method === "PercentOfBasic" ? "% of basic" : method === "PerOvertimeHour" ? "Per overtime hour" : "Fixed amount"}</option>)}</select></label>
+              <label className="form-field"><span>Amount / rate <b>*</b></span><input type="number" required min="0" step="0.01" value={component.amount} onChange={(e) => updateComponent(index, "amount", e.target.value)} /></label>
+              <label className="phase-two-small-check"><input type="checkbox" checked={component.is_taxable} onChange={(e) => updateComponent(index, "is_taxable", e.target.checked)} /> Taxable</label>
+              <label className="phase-two-small-check"><input type="checkbox" checked={component.is_recurring} onChange={(e) => updateComponent(index, "is_recurring", e.target.checked)} /> Recurring</label>
+              <button type="button" className="phase-two-icon-danger" aria-label={`Remove component ${index + 1}`} onClick={() => setComponents((previous) => previous.filter((_, currentIndex) => currentIndex !== index))}><Trash2 size={16} /></button>
+            </div>)}
+          </div>
+          <div className="form-actions"><button type="submit" className="primary-button" disabled={saving || employeeOptions.length === 0}>{saving ? "Saving structure…" : "Create compensation structure"}</button></div>
+        </form>
+      </section>
+
+      <section className="content-card"><div className="section-heading"><div><h2>Compensation structure history</h2><p>{structures.length} version{structures.length === 1 ? "" : "s"} loaded. Overlapping effective dates are rejected by the API.</p></div></div>
+        {loading ? <EmptyRows text="Loading structures…" /> : structures.length === 0 ? <EmptyRows text="No compensation structures exist yet." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Employee</th><th>Structure</th><th>Effective dates</th><th>Basic salary</th><th>Components</th><th>Actions</th></tr></thead><tbody>{structures.map((structure) => { const employee = employeeOptions.find((row) => Number(row.id) === Number(structure.employee_id)); return <tr key={structure.id}><td className="table-primary">{employee?.employee_code || `Employee #${structure.employee_id}`}<div className="table-secondary">ID {structure.employee_id}</div></td><td className="table-primary">{structure.structure_name}<div className="table-secondary">Structure #{structure.id}</div></td><td>{dateLabel(structure.effective_from)} – {dateLabel(structure.effective_to)}</td><td className="table-money">{money(structure.basic_salary, structure.currency)}</td><td>{structure.components?.length || 0}</td><td><div className="table-action-buttons"><button type="button" className="small-action-button small-action-lock" onClick={() => { setSelectedPreviewId(String(structure.id)); setPreview(null); }}>Preview</button><button type="button" className="small-action-button employee-action-edit" onClick={() => void loadHistory(structure)}><History size={13} />History</button>{isAdmin && !structure.effective_to && <button type="button" className="small-action-button employee-action-deactivate" onClick={() => { setClosing(structure); setCloseForm({ effective_to: localDate(), reason: "" }); }}>Close</button>}</div></td></tr>; })}</tbody></table></div>}
+      </section>
+
+      {closing && <section className="content-card"><div className="section-heading"><div><h2>Close structure #{closing.id}</h2><p>{closing.structure_name} · Employee #{closing.employee_id}. Only Admin can close a compensation structure.</p></div><button type="button" className="secondary-button" onClick={() => setClosing(null)}>Cancel</button></div><form className="data-form" onSubmit={closeStructure}><label className="form-field"><span>Effective end date <b>*</b></span><input type="date" required min={closing.effective_from} value={closeForm.effective_to} onChange={(e) => setCloseForm({ ...closeForm, effective_to: e.target.value })} /></label><label className="form-field form-field-full"><span>Reason <b>*</b></span><textarea required minLength={3} maxLength={500} rows={3} value={closeForm.reason} onChange={(e) => setCloseForm({ ...closeForm, reason: e.target.value })} placeholder="Reason for ending this version" /></label><div className="form-actions"><button className="primary-button" type="submit" disabled={saving}>Close structure</button></div></form></section>}
+
+      <section className="content-card"><div className="section-heading"><div><h2>Compensation preview</h2><p>Read-only estimate. Attendance, LOP, proration and payroll adjustments are not included.</p></div><div className="section-heading-icon"><Wallet size={19} /></div></div>
+        <form className="data-form" onSubmit={runPreview}><label className="form-field"><span>Structure <b>*</b></span><select required value={selectedPreviewId} onChange={(e) => { setSelectedPreviewId(e.target.value); setPreview(null); }}><option value="">Choose structure</option>{structures.map((structure) => <option key={structure.id} value={structure.id}>#{structure.id} · {structure.structure_name} · Employee #{structure.employee_id}</option>)}</select></label><label className="form-field"><span>Overtime hours</span><input type="number" min="0" max="999999" step="0.25" value={overtimeHours} onChange={(e) => setOvertimeHours(e.target.value)} /></label><label className="phase-two-small-check"><input type="checkbox" checked={includeNonRecurring} onChange={(e) => setIncludeNonRecurring(e.target.checked)} /> Include non-recurring items</label><div className="form-actions"><button className="primary-button" type="submit" disabled={previewLoading || !selectedPreviewId}><Wallet size={15} />{previewLoading ? "Calculating…" : "Calculate preview"}</button></div></form>
+        {preview && <div className="phase-two-preview"><div className="phase-two-preview-title"><strong>{preview.structure_name}</strong><span className="phase-two-chip phase-two-chip-selected">Preview only · no payroll record created</span></div><div className="phase-two-metric-grid"><div><span>Basic salary</span><strong>{money(preview.basic_salary, preview.currency)}</strong></div><div><span>Additional earnings</span><strong>{money(preview.additional_earnings, preview.currency)}</strong></div><div><span>Gross earnings</span><strong>{money(preview.gross_earnings, preview.currency)}</strong></div><div><span>Total deductions</span><strong>{money(preview.total_deductions, preview.currency)}</strong></div><div className="phase-two-net-metric"><span>Estimated net salary</span><strong>{money(preview.estimated_net_salary, preview.currency)}</strong></div></div><div className="table-wrap"><table className="data-table"><thead><tr><th>Component</th><th>Type</th><th>Method</th><th>Configured</th><th>Calculated</th><th>Included</th></tr></thead><tbody>{(preview.components || []).map((item) => <tr key={item.component_id}><td className="table-primary">{item.component_name}<div className="table-secondary">{item.formula}</div></td><td>{item.component_type}</td><td>{item.calculation_method}</td><td>{item.calculation_method === "PercentOfBasic" ? `${item.configured_amount}%` : item.calculation_method === "PerOvertimeHour" ? `${money(item.configured_amount, preview.currency)} / hr` : money(item.configured_amount, preview.currency)}</td><td className="table-money">{money(item.calculated_amount, preview.currency)}</td><td>{item.included_in_preview ? "Yes" : "No"}</td></tr>)}</tbody></table></div><p className="phase-two-note"><ShieldCheck size={15} /> {preview.note}</p></div>}
+      </section>
+
+      {historyId && <section className="content-card"><div className="section-heading"><div><h2>Structure audit history · #{historyId}</h2><p>Audit events recorded for the selected structure.</p></div><button type="button" className="secondary-button" onClick={() => { setHistoryId(null); setHistoryRows(null); }}>Close</button></div>{historyRows === null ? <EmptyRows text="Loading audit history…" /> : historyRows.length === 0 ? <EmptyRows text="No audit events were found." /> : <div className="table-wrap"><table className="data-table"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>{historyRows.map((item) => <tr key={item.id}><td>{dateTimeLabel(item.created_at)}</td><td>{item.actor_name} · {item.actor_role}</td><td>{item.action}</td><td><code className="phase-two-json">{JSON.stringify(item.details || {})}</code></td></tr>)}</tbody></table></div>}</section>}
+      {selectedStructure && <p className="phase-two-muted">Preview selected: structure #{selectedStructure.id}, effective {dateLabel(selectedStructure.effective_from)} to {dateLabel(selectedStructure.effective_to)}.</p>}
+    </div>
+  );
+}

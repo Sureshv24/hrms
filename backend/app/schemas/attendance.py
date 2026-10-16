@@ -27,3 +27,5 @@ class AttendanceMonthlySummary(BaseModel):
     year: int
     total_days_present: int
     total_working_hours: float
+    scheduled_working_days: int = 0
+    holidays_excluded: int = 0

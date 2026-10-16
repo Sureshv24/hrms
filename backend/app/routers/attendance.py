@@ -1,8 +1,9 @@
+import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -11,8 +12,10 @@ from app.core.permissions import require_roles
 from app.db.database import get_db
 from app.models.attendance import Attendance
 from app.models.employee import Employee
+from app.models.holiday import Holiday, EmployeeHolidaySelection
 from app.models.shift import Shift, EmployeeShiftAssignment
 from app.models.user import User
+from app.services.notification_service import create_in_app_notification
 from app.routers.auth import get_current_user
 from app.schemas.attendance import (
     AttendanceResponse,
@@ -20,6 +23,8 @@ from app.schemas.attendance import (
 )
 from app.utils.audit import record_audit_log
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/attendance",
@@ -317,6 +322,54 @@ def to_response(record: Attendance, db: Session) -> dict:
     return response
 
 
+def notify_attendance_in_app_safely(
+    db: Session,
+    user: User,
+    record: Attendance,
+    event: str,
+) -> None:
+    try:
+        if event == "check-in":
+            event_time = record.check_in
+            title = "Attendance check-in recorded"
+            action_text = "checked in"
+        else:
+            event_time = record.check_out
+            title = "Attendance check-out recorded"
+            action_text = "checked out"
+
+        if event_time is None:
+            return
+
+        local_time = (
+            as_utc_datetime(event_time)
+            .astimezone(COMPANY_TZ)
+            .strftime("%H:%M")
+        )
+
+        notification = create_in_app_notification(
+            db=db,
+            recipient_user_id=user.id,
+            title=title,
+            message=(
+                f"Your attendance for {record.attendance_date.isoformat()} "
+                f"was {action_text} at {local_time}."
+            ),
+            category="attendance",
+            created_by_user_id=user.id,
+            source_entity_type="attendance",
+            source_entity_id=record.id,
+        )
+        if notification is not None:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unable to create attendance notification for attendance_id=%s",
+            record.id,
+        )
+
+
 def get_attendance_or_404(
     db: Session,
     attendance_id: int,
@@ -446,6 +499,9 @@ def check_in(
             detail="Unable to record check-in",
         ) from exc
 
+    notify_attendance_in_app_safely(
+        db=db, user=current_user, record=record, event="check-in"
+    )
     return to_response(record, db)
 
 
@@ -547,6 +603,9 @@ def check_out(
             detail="Unable to record check-out",
         ) from exc
 
+    notify_attendance_in_app_safely(
+        db=db, user=current_user, record=record, event="check-out"
+    )
     return to_response(record, db)
 
 
@@ -586,6 +645,68 @@ def my_attendance(
 # ---------------------------------------------------------
 # EMPLOYEE: MONTHLY ATTENDANCE SUMMARY
 # ---------------------------------------------------------
+
+def get_monthly_holiday_metrics(
+    db: Session,
+    employee: Employee,
+    start_date: date,
+    end_date_exclusive: date,
+) -> dict[str, int]:
+    """Count weekdays and applicable holidays for a monthly summary."""
+    weekdays = set()
+    current_date = start_date
+
+    while current_date < end_date_exclusive:
+        if current_date.weekday() < 5:
+            weekdays.add(current_date)
+        current_date += timedelta(days=1)
+
+    if not weekdays:
+        return {"scheduled_working_days": 0, "holidays_excluded": 0}
+
+    applicable_filters = [Holiday.holiday_type == "Company"]
+
+    if employee.region and employee.region.strip():
+        applicable_filters.append(
+            and_(
+                Holiday.holiday_type == "Regional",
+                func.lower(func.trim(Holiday.region))
+                == employee.region.strip().lower(),
+            )
+        )
+
+    selected_holiday_ids = (
+        db.query(EmployeeHolidaySelection.holiday_id)
+        .filter(EmployeeHolidaySelection.employee_id == employee.id)
+    )
+    applicable_filters.append(
+        and_(
+            Holiday.holiday_type == "Optional",
+            Holiday.id.in_(selected_holiday_ids),
+        )
+    )
+
+    holiday_rows = (
+        db.query(Holiday.holiday_date)
+        .filter(
+            Holiday.is_active.is_(True),
+            Holiday.holiday_date >= start_date,
+            Holiday.holiday_date < end_date_exclusive,
+            or_(*applicable_filters),
+        )
+        .all()
+    )
+
+    # A holiday on a weekend does not reduce scheduled weekdays.
+    holiday_dates = {
+        row[0] for row in holiday_rows if row[0] in weekdays
+    }
+
+    return {
+        "scheduled_working_days": len(weekdays - holiday_dates),
+        "holidays_excluded": len(holiday_dates),
+    }
+
 
 @router.get(
     "/summary",
@@ -630,11 +751,16 @@ def monthly_summary(
         if hours is not None:
             total_hours += hours
 
+    calendar_metrics = get_monthly_holiday_metrics(
+        db, employee, start_date, end_date
+    )
+
     return {
         "month": month,
         "year": year,
         "total_days_present": len(records),
         "total_working_hours": round(total_hours, 2),
+        **calendar_metrics,
     }
 
 

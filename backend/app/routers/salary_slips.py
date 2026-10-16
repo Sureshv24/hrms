@@ -306,25 +306,55 @@ def download_salary_slip(
         ),
     ])
 
-    salary_data = [
-        ["Description", "Amount"],
+    salary_data = [["Description", "Amount"]]
+
+    # Use the saved snapshot so historical payslips do not recalculate
+    # compensation from a later employee salary structure.
+    compensation_breakdown = payroll.compensation_breakdown or []
+
+    for component in compensation_breakdown:
+        component_name = str(
+            component.get("component_name") or "Compensation component"
+        )
+        component_type = component.get("component_type")
+        period_amount = component.get("period_amount", "0.00")
+        amount_text = format_amount(period_amount)
+
+        if component_type == "Deduction":
+            salary_data.append(
+                [f"Deduction: {component_name}", f"- {amount_text}"]
+            )
+        else:
+            salary_data.append(
+                [f"Earning: {component_name}", amount_text]
+            )
+
+    salary_data.extend([
+        ["Gross Earnings", format_amount(payroll.gross_salary)],
+        ["Loss of Pay Days", str(payroll.lop_days)],
+        ["LOP Deduction", format_amount(payroll.lop_deduction)],
         [
-            "Monthly Gross Salary",
-            format_amount(payroll.gross_salary),
+            "Total Compensation Deductions",
+            format_amount(
+                getattr(payroll, "compensation_deductions", 0) or 0
+            ),
         ],
-        [
-            "Loss of Pay Days",
-            str(payroll.lop_days),
-        ],
-        [
-            "LOP Deduction",
-            format_amount(payroll.lop_deduction),
-        ],
-        [
-            "Net Salary",
-            format_amount(payroll.net_salary),
-        ],
-    ]
+    ])
+
+    adjustment_value = float(payroll.manual_adjustment_amount or 0)
+    adjustment_amount = format_amount(abs(adjustment_value))
+
+    if adjustment_value > 0:
+        adjustment_text = f"+ {adjustment_amount}"
+    elif adjustment_value < 0:
+        adjustment_text = f"- {adjustment_amount}"
+    else:
+        adjustment_text = format_amount(0)
+
+    salary_data.extend([
+        ["Manual Adjustment", adjustment_text],
+        ["Net Salary", format_amount(payroll.net_salary)],
+    ])
 
     salary_table = Table(
         salary_data,

@@ -1,4 +1,4 @@
-
+﻿
 from datetime import datetime
 from decimal import Decimal
 
@@ -14,6 +14,9 @@ class PayrollResponse(BaseModel):
     year: int
 
     monthly_salary: Decimal
+    compensation_structure_id: int | None = None
+    compensation_deductions: Decimal = Decimal("0.00")
+    compensation_breakdown: list[dict] | None = None
     present_days: int
     lop_days: int
 
@@ -34,3 +37,4 @@ class PayrollResponse(BaseModel):
     locked_at: datetime | None = None
     paid_at: datetime | None = None
     created_at: datetime
+

@@ -9,6 +9,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CalendarDays,
+  Bell,
   CheckCircle2,
   Clock3,
   Download,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 
 import api from "./api";
+import PhaseTwoPages from "./PhaseTwoPages";
 import "./App.css";
 
 function localDate(date = new Date()) {
@@ -175,6 +177,7 @@ function App() {
   const [loginError, setLoginError] = useState("");
 
   const [activePage, setActivePage] = useState("Dashboard");
+  const [phaseTwoRefreshKey, setPhaseTwoRefreshKey] = useState(0);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [dashboard, setDashboard] = useState(emptyDashboard);
   const [loading, setLoading] = useState(false);
@@ -215,6 +218,10 @@ function App() {
         { label: "Employees", icon: Users },
         { label: "Leave Management", icon: CalendarDays },
         { label: "Payroll", icon: Wallet },
+        { label: "Holiday Calendar", icon: CalendarDays },
+        { label: "Notifications", icon: Bell },
+        { label: "Shift Management", icon: Clock3 },
+        { label: "Compensation", icon: Wallet },
         { label: "Audit Logs", icon: ClipboardList },
       ]
     : [
@@ -222,6 +229,8 @@ function App() {
         { label: "Attendance", icon: Clock3 },
         { label: "My Leave", icon: CalendarDays },
         { label: "My Payroll", icon: Wallet },
+        { label: "Holiday Calendar", icon: CalendarDays },
+        { label: "Notifications", icon: Bell },
       ];
 
   useEffect(() => {
@@ -1038,10 +1047,12 @@ function App() {
               onClick={() =>
                 activePage === "Audit Logs"
                   ? loadAuditLogs(auditSkip, auditFilters)
-                  : loadDashboard()
+                  : ["Holiday Calendar", "Notifications", "Shift Management", "Compensation"].includes(activePage)
+                    ? setPhaseTwoRefreshKey((value) => value + 1)
+                    : loadDashboard()
               }
               disabled={loading || auditLoading}
-              title={activePage === "Audit Logs" ? "Refresh audit logs" : "Refresh dashboard"}
+              title={activePage === "Audit Logs" ? "Refresh audit logs" : ["Holiday Calendar", "Notifications", "Shift Management", "Compensation"].includes(activePage) ? `Refresh ${activePage.toLowerCase()}` : "Refresh dashboard"}
             >
               <RefreshCw
                 size={17}
@@ -2412,6 +2423,18 @@ function App() {
                 )}
               </section>
             </div>
+          )}
+
+          {["Holiday Calendar", "Notifications", "Shift Management", "Compensation"].includes(activePage) && (
+            <PhaseTwoPages
+              key={activePage}
+              page={activePage}
+              user={user}
+              isManagement={isManagement}
+              employees={dashboard.employees}
+              employee={dashboard.employee}
+              refreshKey={phaseTwoRefreshKey}
+            />
           )}
 
           <footer className="app-footer">

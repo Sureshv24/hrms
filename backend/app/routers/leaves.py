@@ -21,6 +21,7 @@ from app.schemas.leave import (
 from app.services.email_service import (
     send_leave_notification_email,
 )
+from app.services.notification_service import create_in_app_notification
 from app.utils.audit import record_audit_log
 
 
@@ -30,6 +31,34 @@ router = APIRouter(
     prefix="/leaves",
     tags=["Leave Management"],
 )
+
+
+def _notify_leave_owner_in_app_safely(
+    db, recipient, leave, title: str, message: str,
+    created_by_user_id: int | None = None,
+) -> None:
+    if recipient is None:
+        return
+    try:
+        notification = create_in_app_notification(
+            db=db,
+            recipient_user_id=recipient.id,
+            title=title,
+            message=message,
+            category="leave",
+            created_by_user_id=created_by_user_id,
+            source_entity_type="leave",
+            source_entity_id=leave.id,
+        )
+        if notification is not None:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Unable to create in-app notification for leave_id=%s",
+            leave.id,
+        )
+
 
 # Example company policy. Adjust these values as needed.
 DEFAULT_BALANCES = {
@@ -264,6 +293,19 @@ def apply_leave(
         leave=leave,
     )
 
+    _notify_leave_owner_in_app_safely(
+        db=db,
+        recipient=current_user,
+        leave=leave,
+        title="Leave application submitted",
+        message=(
+            f"Your {leave.leave_type} leave request from "
+            f"{leave.start_date.isoformat()} to "
+            f"{leave.end_date.isoformat()} was submitted and is pending review."
+        ),
+        created_by_user_id=current_user.id,
+    )
+
     return leave
 
 
@@ -489,6 +531,18 @@ def review_leave(
             db=db,
             recipient=leave_owner,
             leave=leave,
+        )
+        _notify_leave_owner_in_app_safely(
+            db=db,
+            recipient=leave_owner,
+            leave=leave,
+            title=f"Leave request {leave.status.lower()}",
+            message=(
+                f"Your {leave.leave_type} leave request from "
+                f"{leave.start_date.isoformat()} to "
+                f"{leave.end_date.isoformat()} is now {leave.status}."
+            ),
+            created_by_user_id=current_user.id,
         )
     else:
         logger.warning(

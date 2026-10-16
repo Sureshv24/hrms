@@ -1,10 +1,11 @@
-
+﻿
 from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     Numeric,
     String,
     UniqueConstraint,
@@ -40,6 +41,16 @@ class Payroll(Base):
 
     # Snapshot of the employee's monthly salary at generation time.
     monthly_salary = Column(Numeric(12, 2), nullable=False)
+
+    # Compensation snapshot fields for newly generated payroll.
+    compensation_structure_id = Column(Integer, nullable=True)
+    compensation_deductions = Column(
+        Numeric(12, 2),
+        nullable=False,
+        default=0,
+        server_default="0.00",
+    )
+    compensation_breakdown = Column(JSON, nullable=True)
 
     present_days = Column(
         Integer,
@@ -115,3 +126,4 @@ class Payroll(Base):
         nullable=False,
         server_default=func.now(),
     )
+

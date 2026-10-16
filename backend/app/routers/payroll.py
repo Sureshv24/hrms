@@ -16,10 +16,12 @@ from app.models.employee import Employee
 from app.models.leave import LeaveRequest
 from app.models.holiday import Holiday, EmployeeHolidaySelection
 from app.models.payroll import Payroll
+from app.services.compensation_payroll import calculate_compensation_for_period
 from app.models.user import User
 from app.routers.auth import get_current_user
 from app.schemas.payroll import PayrollResponse
 from app.services.email_service import send_payroll_notification_email
+from app.services.notification_service import create_in_app_notification
 from app.utils.audit import record_audit_log
 
 
@@ -110,6 +112,35 @@ def notify_payroll_owner_safely(db: Session, payroll: Payroll) -> None:
             return
 
         user = db.query(User).filter(User.id == employee.user_id).first()
+
+        # In-app delivery is independent of email delivery.
+        if user is not None:
+            try:
+                notification = create_in_app_notification(
+                    db=db,
+                    recipient_user_id=user.id,
+                    title=f"Payroll {payroll.status.lower()}",
+                    message=(
+                        f"Your payroll for {payroll.month:02d}/{payroll.year} "
+                        f"is now {payroll.status}. "
+                        f"Net salary: {payroll.net_salary}."
+                    ),
+                    category="payroll",
+                    created_by_user_id=getattr(
+                        payroll, "generated_by", None
+                    ),
+                    source_entity_type="payroll",
+                    source_entity_id=payroll.id,
+                )
+                if notification is not None:
+                    db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Unable to create in-app payroll notification for payroll_id=%s",
+                    payroll.id,
+                )
+
         if user is None or not user.email:
             logger.warning(
                 "Payroll notification skipped: user/email missing for payroll_id=%s",
@@ -454,6 +485,38 @@ def generate_payroll(
         as_of_date=today,
     )
 
+    compensation_structure_id = None
+    compensation_deductions = ZERO_MONEY
+    compensation_breakdown = None
+
+    compensation_values = calculate_compensation_for_period(
+        db=db,
+        employee=employee,
+        year=year,
+        month=month,
+        as_of_date=today,
+        lop_days=int(values["lop_days"]),
+    )
+
+    # Existing employees without a structure retain the legacy policy.
+    if compensation_values is not None:
+        monthly_salary = money(
+            Decimal(str(compensation_values["monthly_salary"]))
+        )
+        values["gross_salary"] = compensation_values["gross_salary"]
+        values["lop_deduction"] = compensation_values["lop_deduction"]
+        values["net_salary"] = compensation_values["net_salary"]
+
+        compensation_structure_id = (
+            compensation_values["compensation_structure_id"]
+        )
+        compensation_deductions = money(
+            Decimal(str(compensation_values["compensation_deductions"]))
+        )
+        compensation_breakdown = (
+            compensation_values["compensation_breakdown"]
+        )
+
     payroll = Payroll(
         employee_id=employee_id,
         month=month,
@@ -464,6 +527,9 @@ def generate_payroll(
         gross_salary=values["gross_salary"],
         lop_deduction=values["lop_deduction"],
         net_salary=values["net_salary"],
+        compensation_structure_id=compensation_structure_id,
+        compensation_deductions=compensation_deductions,
+        compensation_breakdown=compensation_breakdown,
         manual_adjustment_amount=ZERO_MONEY,
         status="Generated",
         is_locked=False,
@@ -490,6 +556,8 @@ def generate_payroll(
                 "gross_salary": str(values["gross_salary"]),
                 "lop_deduction": str(values["lop_deduction"]),
                 "net_salary": str(values["net_salary"]),
+                "compensation_structure_id": compensation_structure_id,
+                "compensation_deductions": str(compensation_deductions),
                 "status": "Generated",
                 "month_is_complete": bool(values["month_is_complete"]),
                 "salary_policy": "calendar-day joining proration; 30-day LOP basis",
@@ -649,8 +717,14 @@ def adjust_payroll(
 
         # The submitted amount replaces the earlier manual adjustment.
         # Positive is an addition; negative is a deduction.
+        compensation_deductions = money(
+            Decimal(str(payroll.compensation_deductions or ZERO_MONEY))
+        )
         new_net_salary = money(
-            gross_salary - lop_deduction + requested_adjustment
+            gross_salary
+            - lop_deduction
+            - compensation_deductions
+            + requested_adjustment
         )
         if new_net_salary < ZERO_MONEY:
             raise HTTPException(
@@ -743,21 +817,75 @@ def lock_payroll(
     # payroll draft that was generated before the month ended. Preserve the
     # existing manual adjustment but reapply it to the recomputed base net pay.
     try:
-        monthly_salary = money(Decimal(str(payroll.monthly_salary)))
-        values = calculate_payroll_values(
-            db=db,
-            employee=employee,
-            year=payroll.year,
-            month=payroll.month,
-            monthly_salary=monthly_salary,
-            as_of_date=date.today(),
-        )
+        today = date.today()
+
+        if payroll.compensation_structure_id is not None:
+            attendance_values = calculate_payroll_values(
+                db=db,
+                employee=employee,
+                year=payroll.year,
+                month=payroll.month,
+                monthly_salary=money(Decimal(str(employee.salary))),
+                as_of_date=today,
+            )
+
+            compensation_values = calculate_compensation_for_period(
+                db=db,
+                employee=employee,
+                year=payroll.year,
+                month=payroll.month,
+                as_of_date=today,
+                lop_days=int(attendance_values["lop_days"]),
+            )
+
+            if compensation_values is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Compensation structure is unavailable for this "
+                        "payroll period. Payroll was not locked."
+                    ),
+                )
+
+            values = dict(attendance_values)
+            values["gross_salary"] = compensation_values["gross_salary"]
+            values["lop_deduction"] = compensation_values["lop_deduction"]
+            values["net_salary"] = compensation_values["net_salary"]
+
+            payroll.monthly_salary = money(
+                Decimal(str(compensation_values["monthly_salary"]))
+            )
+            payroll.compensation_structure_id = (
+                compensation_values["compensation_structure_id"]
+            )
+            payroll.compensation_deductions = money(
+                Decimal(str(compensation_values["compensation_deductions"]))
+            )
+            payroll.compensation_breakdown = (
+                compensation_values["compensation_breakdown"]
+            )
+        else:
+            # Preserve the legacy lock calculation for older payroll.
+            monthly_salary = money(Decimal(str(payroll.monthly_salary)))
+            values = calculate_payroll_values(
+                db=db,
+                employee=employee,
+                year=payroll.year,
+                month=payroll.month,
+                monthly_salary=monthly_salary,
+                as_of_date=today,
+            )
+
         manual_adjustment = money(
             Decimal(str(payroll.manual_adjustment_amount or ZERO_MONEY))
+        )
+        compensation_deductions = money(
+            Decimal(str(payroll.compensation_deductions or ZERO_MONEY))
         )
         recomputed_net = money(
             Decimal(str(values["gross_salary"]))
             - Decimal(str(values["lop_deduction"]))
+            - compensation_deductions
             + manual_adjustment
         )
         if recomputed_net < ZERO_MONEY:

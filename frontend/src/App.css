@@ -4645,3 +4645,109 @@ textarea:focus-visible {
     flex: 1;
   }
 }
+
+/* ==========================================================
+   Phase 2 pages: Holiday Calendar, Notifications, Shifts,
+   and Compensation. These styles extend the existing theme.
+   ========================================================== */
+.phase-two { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+.phase-two-header { display: flex; align-items: center; gap: 17px; margin: 0; }
+.phase-two-header-icon { display: grid; flex: 0 0 52px; place-items: center; width: 52px; height: 52px; border: 1px solid #e2e3ff; border-radius: 15px; color: var(--hrms-purple); background: linear-gradient(145deg, #f0efff, #e7fbfa); }
+.phase-two-header-copy { flex: 1; min-width: 0; }
+.phase-two-eyebrow { color: var(--hrms-purple); font-size: 9px; font-weight: 850; letter-spacing: 1.7px; }
+.phase-two-header h2 { margin: 5px 0 0; color: #1a2540; font-size: 19px; font-weight: 820; letter-spacing: -0.45px; }
+.phase-two-header p { margin: 7px 0 0; color: var(--hrms-muted); font-size: 11px; line-height: 1.7; }
+.phase-two-header-action { display: flex; flex-shrink: 0; align-items: center; gap: 8px; }
+.phase-two-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.phase-two-filter-label { display: flex; align-items: center; gap: 7px; color: #68758b; font-size: 10px; font-weight: 700; }
+.phase-two-filter-label input { width: auto; min-width: 120px; max-width: 190px; min-height: 37px; padding: 7px 9px; border: 1px solid #dfe5ef; border-radius: 9px; color: #28344e; background: #fff; font-size: 11px; }
+.phase-two-check { display: inline-flex; align-items: center; gap: 7px; color: #606d83; font-size: 10px; font-weight: 650; white-space: nowrap; }
+.phase-two-check input, .phase-two-preference input, .phase-two-small-check input { accent-color: var(--hrms-purple); }
+.phase-two-empty { padding: 28px 15px; border: 1px dashed #dce3f0; border-radius: 12px; color: #8490a5; background: #fbfcff; text-align: center; font-size: 11px; line-height: 1.65; }
+.phase-two-holiday-list, .phase-two-notification-list { display: flex; flex-direction: column; }
+.phase-two-holiday-row { display: flex; align-items: center; gap: 14px; padding: 15px 0; border-bottom: 1px solid #edf0f6; }
+.phase-two-holiday-row:first-child { padding-top: 0; }
+.phase-two-holiday-row:last-child { padding-bottom: 0; border-bottom: 0; }
+.phase-two-date-tile { display: flex; flex: 0 0 54px; flex-direction: column; align-items: center; justify-content: center; min-height: 58px; border: 1px solid #e6e8ff; border-radius: 13px; color: #5549db; background: #f5f4ff; }
+.phase-two-date-tile strong { font-size: 20px; font-weight: 850; line-height: 1.15; }
+.phase-two-date-tile span { margin-top: 4px; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.phase-two-row-main { flex: 1; min-width: 0; }
+.phase-two-row-main > strong, .phase-two-row-main > .phase-two-notification-heading strong { color: #27324e; font-size: 12px; font-weight: 800; }
+.phase-two-row-main > p { margin: 6px 0 0; color: #79869b; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.phase-two-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.phase-two-chip { display: inline-flex; align-items: center; padding: 4px 7px; border: 1px solid #e1e6f0; border-radius: 999px; color: #66738b; background: #f8f9fc; font-size: 9px; font-weight: 750; line-height: 1.2; white-space: nowrap; }
+.phase-two-chip-company { border-color: #d9e4ff; color: #405bc0; background: #f0f5ff; }
+.phase-two-chip-regional { border-color: #d1efe7; color: #087c68; background: #effcf8; }
+.phase-two-chip-optional { border-color: #eadcfb; color: #8050b7; background: #faf4ff; }
+.phase-two-chip-selected { border-color: #c9eddb; color: #08794f; background: #effcf5; }
+.phase-two-unread-counter { display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 62px; min-height: 58px; padding: 7px; border: 1px solid #e4e5ff; border-radius: 14px; color: #5549d6; background: #f5f4ff; }
+.phase-two-unread-counter strong { font-size: 21px; font-weight: 850; line-height: 1.1; }
+.phase-two-unread-counter span { margin-top: 4px; color: #7e82b2; font-size: 9px; font-weight: 750; }
+.phase-two-notification { display: flex; align-items: flex-start; gap: 13px; padding: 17px 0; border-bottom: 1px solid #edf0f6; }
+.phase-two-notification:first-child { padding-top: 0; }
+.phase-two-notification:last-child { padding-bottom: 0; border-bottom: 0; }
+.phase-two-notification-icon { display: grid; flex: 0 0 39px; place-items: center; width: 39px; height: 39px; border: 1px solid #e4e5ff; border-radius: 12px; color: #6457e7; background: #f4f3ff; }
+.phase-two-notification-unread .phase-two-notification-icon { color: #0c8d85; border-color: #ccefe8; background: #edfbf8; }
+.phase-two-notification-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.phase-two-notification .phase-two-row-main > p { margin: 7px 0; }
+.phase-two-notification-read { opacity: .82; }
+.phase-two-muted { display: block; margin-top: 7px; color: #8b96a9; font-size: 9px; line-height: 1.6; }
+.phase-two-preference-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.phase-two-preference { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; padding: 14px; border: 1px solid #e7ebf4; border-radius: 12px; background: #fcfdff; cursor: pointer; }
+.phase-two-preference > span { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.phase-two-preference strong { color: #2a3550; font-size: 11px; font-weight: 800; text-transform: capitalize; }
+.phase-two-preference small { color: #8994a8; font-size: 9px; line-height: 1.5; }
+.phase-two-preference input { flex-shrink: 0; width: 17px; height: 17px; }
+.phase-two-components-wrap { display: flex; flex-direction: column; gap: 12px; }
+.phase-two-subheading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.phase-two-subheading > div { display: flex; flex-direction: column; gap: 5px; }
+.phase-two-subheading strong { color: #293650; font-size: 12px; font-weight: 800; }
+.phase-two-subheading small { color: #8894a8; font-size: 10px; line-height: 1.5; }
+.phase-two-component-row { display: grid; grid-template-columns: 1.4fr .8fr 1.1fr .75fr auto auto auto; align-items: end; gap: 11px; padding: 14px; border: 1px solid #e7ebf4; border-radius: 12px; background: #fafbff; }
+.phase-two-small-check { display: inline-flex; align-items: center; gap: 7px; min-height: 43px; color: #5f6d83; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.phase-two-small-check input { width: 15px; height: 15px; }
+.phase-two-icon-danger { display: grid; place-items: center; width: 36px; height: 36px; margin-bottom: 3px; border: 1px solid #f4d4d8; border-radius: 9px; color: #bb3f50; background: #fff4f5; }
+.phase-two-icon-danger:hover { background: #ffe8eb; }
+.phase-two-report-form { align-items: end; }
+.phase-two-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 16px 0; }
+.phase-two-metric-grid > div { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 15px; border: 1px solid #e6eaf3; border-radius: 12px; background: #fbfcff; }
+.phase-two-metric-grid span { color: #7d899e; font-size: 10px; font-weight: 650; }
+.phase-two-metric-grid strong { color: #1e2945; font-size: clamp(17px, 2vw, 24px); font-weight: 850; overflow-wrap: anywhere; }
+.phase-two-preview { margin-top: 20px; padding-top: 19px; border-top: 1px solid #edf0f6; }
+.phase-two-preview-title { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.phase-two-preview-title strong { color: #27324e; font-size: 13px; }
+.phase-two-net-metric { border-color: #cfeee1 !important; background: #f0fcf7 !important; }
+.phase-two-net-metric strong { color: #087c59; }
+.phase-two-note { display: flex; align-items: flex-start; gap: 8px; margin: 15px 0 0; padding: 12px; border: 1px solid #e3e8f3; border-radius: 10px; color: #6e7b91; background: #f8faff; font-size: 10px; line-height: 1.7; }
+.phase-two-note svg { flex-shrink: 0; margin-top: 1px; color: #5d56d9; }
+.phase-two-json { display: block; max-width: 390px; color: #66738b; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 9px; }
+
+@media (max-width: 1100px) {
+  .phase-two-component-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .phase-two-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .phase-two-header { align-items: flex-start; flex-wrap: wrap; padding: 18px; }
+  .phase-two-header-action { width: 100%; }
+  .phase-two-header-action .primary-button, .phase-two-header-action .secondary-button { width: 100%; }
+  .phase-two-toolbar { align-items: stretch; width: 100%; }
+  .phase-two-filter-label { flex: 1; align-items: flex-start; flex-direction: column; }
+  .phase-two-filter-label input { width: 100%; max-width: none; }
+  .phase-two-holiday-row, .phase-two-notification { align-items: flex-start; flex-wrap: wrap; }
+  .phase-two-row-main { flex: 1 1 calc(100% - 70px); }
+  .phase-two-holiday-row > .primary-button, .phase-two-holiday-row > .secondary-button, .phase-two-notification > .small-action-button { margin-left: 53px; }
+  .phase-two-preference-grid { grid-template-columns: 1fr; }
+  .phase-two-component-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .phase-two-component-row .phase-two-small-check { min-height: 30px; }
+  .phase-two-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 500px) {
+  .phase-two-header-icon { flex-basis: 43px; width: 43px; height: 43px; }
+  .phase-two-header h2 { font-size: 17px; }
+  .phase-two-component-row { grid-template-columns: 1fr; }
+  .phase-two-metric-grid { grid-template-columns: 1fr 1fr; }
+  .phase-two-report-form .form-actions { align-items: stretch; }
+  .phase-two-report-form .primary-button { width: 100%; }
+  .phase-two-subheading { align-items: flex-start; flex-direction: column; }
+  .phase-two-toolbar > .secondary-button { flex: 1; }
+}

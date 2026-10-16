@@ -19,6 +19,8 @@ from app.models.shift import Shift, EmployeeShiftAssignment
 # API routers
 from app.routers.auth import router as auth_router
 from app.routers.shifts import router as shifts_router
+from app.routers.notifications import router as notifications_router
+from app.routers.compensation import router as compensation_router
 from app.routers.employees import router as employee_router
 from app.routers.attendance import router as attendance_router
 from app.routers.leaves import router as leave_router
@@ -55,6 +57,10 @@ app.add_middleware(
 
 # Initial development setup.
 # Use Alembic migrations for production schema management.
+from app.models.notification import Notification, NotificationPreference
+
+from app.models.compensation import CompensationStructure, CompensationComponent
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -70,6 +76,8 @@ app.include_router(reports_router)
 app.include_router(role_management_router)
 app.include_router(holidays_router)
 app.include_router(shifts_router)
+app.include_router(notifications_router)
+app.include_router(compensation_router)
 
 @app.get("/")
 def home():
@@ -94,6 +102,9 @@ def health():
             "status": "unhealthy",
             "database": "disconnected",
         }
+
+
+
 
 
 
